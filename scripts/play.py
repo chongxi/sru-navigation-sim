@@ -67,7 +67,7 @@ import isaaclab_tasks  # noqa: F401
 import isaaclab_nav_task  # noqa: F401
 
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_onnx
+from isaaclab_nav_task.vecenv_wrapper import SruRslRlVecEnvWrapper
 
 
 def find_latest_checkpoint(log_path: str, checkpoint_pattern: str = "model_.*.pt") -> str:
@@ -219,7 +219,7 @@ def main():
 
     # Instantiate the configs
     env_cfg: ManagerBasedRLEnvCfg = env_cfg_class()
-    agent_cfg: RslRlOnPolicyRunnerCfg = agent_cfg_class()
+    agent_cfg = agent_cfg_class()
 
     # Override config from command line
     if args_cli.num_envs is not None:
@@ -228,7 +228,7 @@ def main():
     # Create the environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     # Wrap the environment
-    env = RslRlVecEnvWrapper(env)
+    env = SruRslRlVecEnvWrapper(env)
 
     # Get checkpoint path
     if args_cli.checkpoint:

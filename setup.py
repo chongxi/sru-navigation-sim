@@ -53,8 +53,8 @@ setup(
     classifiers=[
         "Natural Language :: English",
         "Programming Language :: Python :: 3.10",
-        "Isaac Sim :: 4.5.0",
-        "Isaac Lab :: 2.1.1",
+        "Isaac Sim :: 5.1.0",
+        "Isaac Lab :: 2.3.2",
         "License :: OSI Approved :: MIT License",
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",

@@ -71,10 +71,10 @@ import isaaclab_nav_task  # noqa: F401
 
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.io import dump_pickle, dump_yaml
+from isaaclab.utils.io import dump_yaml
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_nav_task.vecenv_wrapper import SruRslRlVecEnvWrapper
 
 # Set torch backends for better performance
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -87,7 +87,7 @@ def main():
     """Train navigation policy with RSL-RL."""
     # Load the configurations from the registry
     env_cfg = load_cfg_from_registry(args_cli.task, "env_cfg_entry_point")
-    agent_cfg: RslRlOnPolicyRunnerCfg = load_cfg_from_registry(args_cli.task, "rsl_rl_cfg_entry_point")
+    agent_cfg = load_cfg_from_registry(args_cli.task, "rsl_rl_cfg_entry_point")
 
     # Override config from command line
     if args_cli.num_envs is not None:
@@ -102,7 +102,7 @@ def main():
     # Create the environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     # Wrap the environment
-    env = RslRlVecEnvWrapper(env)
+    env = SruRslRlVecEnvWrapper(env)
 
     # Specify log directory
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -121,8 +121,6 @@ def main():
     # Save configuration
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
-    dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
-    dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
     # Run training
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
