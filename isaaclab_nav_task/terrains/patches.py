@@ -264,11 +264,14 @@ def _patch_terrain_generator():
         self.device = device
 
         # Set common values for all sub-terrains
+        from isaaclab.terrains.height_field import HfTerrainBaseCfg
+
         for sub_cfg in self.cfg.sub_terrains.values():
             sub_cfg.size = self.cfg.size
-            sub_cfg.horizontal_scale = self.cfg.horizontal_scale
-            sub_cfg.vertical_scale = self.cfg.vertical_scale
-            sub_cfg.slope_threshold = self.cfg.slope_threshold
+            if isinstance(sub_cfg, HfTerrainBaseCfg):
+                sub_cfg.horizontal_scale = self.cfg.horizontal_scale
+                sub_cfg.vertical_scale = self.cfg.vertical_scale
+                sub_cfg.slope_threshold = self.cfg.slope_threshold
 
         # Set seed for reproducibility
         # - seed=None (default): random terrain each time (for training variety)
@@ -321,6 +324,15 @@ def _patch_terrain_generator():
         # Move flat patches to device
         for name in self.flat_patches:
             self.flat_patches[name] = self.flat_patches[name].to(self.device)
+
+        # Offset the entire terrain and origins so that it is centered
+        transform = np.eye(4)
+        transform[:2, -1] = -self.cfg.size[0] * self.cfg.num_rows * 0.5, -self.cfg.size[1] * self.cfg.num_cols * 0.5
+        self.terrain_mesh.apply_transform(transform)
+        self.terrain_origins += transform[:3, -1]
+        terrain_origins_torch = torch.tensor(self.terrain_origins, dtype=torch.float, device=self.device).unsqueeze(2)
+        for name, value in self.flat_patches.items():
+            self.flat_patches[name] = value + terrain_origins_torch
 
     def _patched_get_terrain_mesh(self, difficulty: float, cfg) -> tuple:
         """Patched _get_terrain_mesh that collects height field data from each terrain."""
