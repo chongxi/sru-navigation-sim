@@ -43,7 +43,7 @@ class B2WNavMDPORunnerCfg(RslRlOnPolicyRunnerCfg):
     )
     algorithm = RslRlPpoAlgorithmCfg(
         class_name="MDPO",
-        value_loss_coef=0.02,
+        value_loss_coef=0.0002,
         use_clipped_value_loss=True,
         clip_param=0.2,
         value_clip_param=0.2,
