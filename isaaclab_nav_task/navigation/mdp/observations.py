@@ -126,10 +126,11 @@ def _ensure_depth_noise_generator_initialized(
 
     # Initialize encoder with the new simplified API
     # The DepthNoiseEncoder now takes camera_config directly
+    device = torch.device("cuda:0")
     DEPTH_NOISE_GENERATOR = DepthNoiseEncoder(
         feature_dim=feature_dim,
         camera_config=config,
-    ).to(torch.device("cuda"))
+    ).to(device)
     DEPTH_NOISE_GENERATOR.eval()
 
     # Create JIT version for inference (optional optimization)
@@ -139,12 +140,12 @@ def _ensure_depth_noise_generator_initialized(
         jit_path = config.depth_encoder_path.replace('.pth', '_jit.pt') if config.depth_encoder_path else None
         if jit_path and os.path.exists(jit_path):
             print(f"  Loading precompiled JIT model from: {jit_path}")
-            JIT_DEPTH_NOISE_GENERATOR = torch.jit.load(jit_path, map_location="cuda")
+            JIT_DEPTH_NOISE_GENERATOR = torch.jit.load(jit_path, map_location=device)
             JIT_DEPTH_NOISE_GENERATOR = torch.jit.optimize_for_inference(JIT_DEPTH_NOISE_GENERATOR)
         else:
             print(f"  JIT compilation requested but no precompiled model found.")
             print(f"  Creating JIT model from encoder...")
-            example_input = torch.randn(1, 1, resolution[1], resolution[0]).cuda()  # (B, C, H, W)
+            example_input = torch.randn(1, 1, resolution[1], resolution[0], device=device)  # (B, C, H, W)
             JIT_DEPTH_NOISE_GENERATOR = torch.jit.trace(DEPTH_NOISE_GENERATOR, example_input)
             JIT_DEPTH_NOISE_GENERATOR = torch.jit.optimize_for_inference(JIT_DEPTH_NOISE_GENERATOR)
     else:
@@ -286,7 +287,7 @@ def height_scan_feat(
     # Initialize the encoder on first call
     if HEIGHTSCAN_FEAT_ENCODER is None:
         print("Initializing height scan feature encoder...")
-        HEIGHTSCAN_FEAT_ENCODER = HeightScanFeatEncoder(feature_dim=64).to(torch.device("cuda"))
+        HEIGHTSCAN_FEAT_ENCODER = HeightScanFeatEncoder(feature_dim=64).to(torch.device("cuda:0"))
         HEIGHTSCAN_FEAT_ENCODER.eval()
         JIT_HEIGHTSCAN_FEAT_ENCODER = torch.jit.script(HEIGHTSCAN_FEAT_ENCODER)
         JIT_HEIGHTSCAN_FEAT_ENCODER = torch.jit.optimize_for_inference(JIT_HEIGHTSCAN_FEAT_ENCODER)

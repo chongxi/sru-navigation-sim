@@ -240,8 +240,12 @@ class DepthNoise(torch.nn.Module):
         )
         random_mask = (torch.rand(B, 1, H, W, device=device) < prob)
 
+        # Ensure buffers are on the same device as the input
+        weights = self.weights.to(device)
+        substitutes = self.substitutes.to(device)
+
         # Compute mean disparity
-        weighted_disparity = F.conv2d(disparity, self.weights, padding=center)
+        weighted_disparity = F.conv2d(disparity, weights, padding=center)
 
         # Compute differences
         differences = torch.abs(disparity - weighted_disparity)
@@ -269,8 +273,8 @@ class DepthNoise(torch.nn.Module):
         output_disparity = torch.where(update_mask, disparity, output_disparity)
 
         # Apply substitutes to fill neighboring pixels
-        filled_values = F.conv2d(update_mask.float() * disparity, self.substitutes, padding=center)
-        counts = F.conv2d(update_mask.float(), self.substitutes, padding=center) + 1e-9
+        filled_values = F.conv2d(update_mask.float() * disparity, substitutes, padding=center)
+        counts = F.conv2d(update_mask.float(), substitutes, padding=center) + 1e-9
         average_filled_values = filled_values / counts
         output_disparity = torch.where(counts >= 1, average_filled_values, output_disparity)
 
