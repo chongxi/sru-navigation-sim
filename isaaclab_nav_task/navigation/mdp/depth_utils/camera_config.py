@@ -79,6 +79,7 @@ DEFAULT_CAMERA_CONFIG = ZEDX_CAMERA_CONFIG
 ROBOT_CAMERA_CONFIGS = {
     "b2w": ZEDX_CAMERA_CONFIG,
     "aow_d": ZEDX_CAMERA_CONFIG,
+    "diff_drive": ZEDX_CAMERA_CONFIG,
 }
 """Dictionary mapping robot names to their camera configurations."""
 

@@ -28,7 +28,7 @@ DEFAULT_CAMERA_CONFIG = CameraConfig(
     max_depth=10.0,
     depth_encoder_path=os.path.join(str(ISAACLAB_ASSETS_DATA_DIR), "Policies", "RSL-ETHZ/AoW_d/depth_encoder", "vae_pretrain_fuse.pth")
 )
-    
+
 class VAESampler(nn.Module):
     def __init__(self, input_dim, latent_dim):
         super(VAESampler, self).__init__()

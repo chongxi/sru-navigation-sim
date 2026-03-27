@@ -116,6 +116,26 @@ def reach_goal_xyz(
     return reward
 
 
+def goal_progress(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Potential-based dense reward: decrease in distance to goal.
+
+    Returns (prev_distance - current_distance) each step. Positive when
+    getting closer, negative when moving away, zero when stationary or
+    pushing into a wall. Returns zero on episode reset / goal resampling
+    (detected when distance jumps by more than physically possible in one step).
+    """
+    goal_cmd: RobotNavigationGoalCommand = env.command_manager._terms[command_name]
+    # Initialize prev_distance buffer on first call
+    if not hasattr(goal_cmd, "_prev_distance_to_goal"):
+        goal_cmd._prev_distance_to_goal = goal_cmd.distance_to_goal.clone()
+    delta = goal_cmd._prev_distance_to_goal - goal_cmd.distance_to_goal
+    goal_cmd._prev_distance_to_goal = goal_cmd.distance_to_goal.clone()
+    # Zero out reset spikes: robot can't move more than ~0.5m in one step
+    # at 10Hz/2.5m/s, so |delta| > 1.0 means goal was resampled
+    delta = torch.where(delta.abs() > 1.0, torch.zeros_like(delta), delta)
+    return delta
+
+
 def backward_movement_penalty(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Small penalty for backward movement as a regularization term.
 

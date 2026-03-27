@@ -45,6 +45,19 @@ parser.add_argument("--seed", type=int, default=None, help="Seed used for the en
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--run_name", type=str, default=None, help="Name of the wandb run (appended to log directory).")
 
+# Terrain arguments
+parser.add_argument("--terrain_rows", type=int, default=None, help="Terrain grid rows (difficulty levels).")
+parser.add_argument("--terrain_cols", type=int, default=None, help="Terrain grid columns (variations).")
+parser.add_argument("--terrain_type", type=str, default=None,
+                    choices=["maze", "non_maze", "both", "flat"],
+                    help="Terrain type: maze, non_maze, both (default from config), or flat (no walls).")
+parser.add_argument("--difficulty", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+                    help="Terrain difficulty range, e.g. --difficulty 0.3 0.8")
+parser.add_argument("--cell_size", type=float, default=None, help="Maze cell size in meters.")
+parser.add_argument("--wall_ratio", type=float, default=None, help="Random wall ratio (0=no walls, 1=max walls).")
+parser.add_argument("--terrain_size", type=float, default=None, help="Terrain tile size in meters (default 30).")
+parser.add_argument("--grid_size", type=int, default=None, help="Maze grid dimension, e.g. 15 for 15x15 (default 15).")
+
 # Append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -98,6 +111,61 @@ def main():
         agent_cfg.max_iterations = args_cli.max_iterations
     if args_cli.run_name is not None:
         agent_cfg.run_name = args_cli.run_name
+
+    # Override terrain config from command line
+    tg = env_cfg.scene.terrain.terrain_generator
+    if tg is not None:
+        if args_cli.terrain_rows is not None:
+            tg.num_rows = args_cli.terrain_rows
+        if args_cli.terrain_cols is not None:
+            tg.num_cols = args_cli.terrain_cols
+        if args_cli.difficulty is not None:
+            tg.difficulty_range = list(args_cli.difficulty)
+        if args_cli.terrain_size is not None:
+            tg.size = (args_cli.terrain_size, args_cli.terrain_size)
+        gs = (args_cli.grid_size, args_cli.grid_size) if args_cli.grid_size is not None else None
+        if args_cli.terrain_type is not None:
+            from isaaclab_nav_task.terrains.hf_terrains_maze_cfg import HfMazeTerrainCfg
+            base = next(iter(tg.sub_terrains.values()))
+            cs = args_cli.cell_size or getattr(base, "cell_size", 2.0)
+            wr = args_cli.wall_ratio if args_cli.wall_ratio is not None else getattr(base, "random_wall_ratio", 0.5)
+            _gs = gs or getattr(base, "grid_size", (15, 15))
+            if args_cli.terrain_type == "maze":
+                tg.sub_terrains = {
+                    "maze": HfMazeTerrainCfg(
+                        proportion=1.0, open_probability=0.9, grid_size=_gs,
+                        cell_size=cs, add_noise_to_flat=False, add_goal=True,
+                        randomize_wall=True, random_wall_ratio=wr,
+                        add_stairs_to_maze=False,
+                    ),
+                }
+            elif args_cli.terrain_type == "non_maze":
+                tg.sub_terrains = {
+                    "non_maze": HfMazeTerrainCfg(
+                        proportion=1.0, open_probability=0.9, grid_size=_gs,
+                        cell_size=cs, add_noise_to_flat=False, add_goal=True,
+                        randomize_wall=True, random_wall_ratio=wr,
+                        non_maze_terrain=True, dynamic_obstacles=False,
+                    ),
+                }
+            elif args_cli.terrain_type == "flat":
+                tg.sub_terrains = {
+                    "flat": HfMazeTerrainCfg(
+                        proportion=1.0, open_probability=1.0, grid_size=_gs,
+                        cell_size=cs, add_noise_to_flat=False, add_goal=True,
+                        randomize_wall=False, random_wall_ratio=0.0,
+                        non_maze_terrain=True, dynamic_obstacles=False,
+                    ),
+                }
+        else:
+            # Apply per-sub-terrain overrides
+            for st in tg.sub_terrains.values():
+                if args_cli.cell_size is not None:
+                    st.cell_size = args_cli.cell_size
+                if args_cli.wall_ratio is not None:
+                    st.random_wall_ratio = args_cli.wall_ratio
+                if gs is not None:
+                    st.grid_size = gs
 
     # Create the environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
