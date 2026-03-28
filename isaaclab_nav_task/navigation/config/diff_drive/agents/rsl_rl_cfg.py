@@ -29,7 +29,7 @@ class DiffDriveNavMDPORunnerCfg(RslRlOnPolicyRunnerCfg):
     reward_shifting_value = 0.05
     policy = RslRlPpoActorCriticCfg(
         class_name="ActorCriticSRU",
-        init_noise_std=[1.0, 1.0],  # [vx, yaw_target] — both explore freely (no accumulation)
+        init_noise_std=[1.0, 1.0],  # [vx, yaw_target_rate]
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
@@ -47,7 +47,7 @@ class DiffDriveNavMDPORunnerCfg(RslRlOnPolicyRunnerCfg):
         use_clipped_value_loss=True,
         clip_param=0.2,
         value_clip_param=0.2,
-        entropy_coef=0.00375,
+        entropy_coef=1.0e-3,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,
@@ -85,7 +85,7 @@ class DiffDriveNavPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     reward_shifting_value = 0.05
     policy = RslRlPpoActorCriticCfg(
         class_name="ActorCriticSRU",
-        init_noise_std=[1.0, 1.0],  # [vx, yaw_target] — both explore freely (no accumulation)
+        init_noise_std=[1.0, 1.0],  # [vx, yaw_target_rate]
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
@@ -103,7 +103,7 @@ class DiffDriveNavPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         use_clipped_value_loss=True,
         clip_param=0.2,
         value_clip_param=0.2,
-        entropy_coef=0.00375,
+        entropy_coef=1.0e-3,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,

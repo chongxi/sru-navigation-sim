@@ -27,6 +27,10 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
 
         initialize_depth_noise_generator(robot_name="diff_drive", use_jit_precompiled=False)
 
+        # Avoid trivial episodes where the robot spawns already too close to the goal.
+        self.commands.robot_goal.min_spawn_goal_distance = 2.0
+        self.commands.robot_goal.spawn_goal_resample_attempts = 32
+
         # --- Robot ---
         self.scene.robot = DIFF_DRIVE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
@@ -49,24 +53,26 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
                 scale=1.0,
                 use_default_offset=False,
             ),
-            policy_scaling=[2.5, 1.0, 3.14159],  # [vx m/s, vy(ignored), yaw_target rad]
+            policy_scaling=[2.5, 0.0, 2.0],  # [vx m/s, vy(ignored), yaw-target slew rate rad/s]
             use_raw_actions=True,
             policy_distr_type="gaussian",
         )
 
         # --- Physics & Control frequency ---
         # 120Hz physics (matches drive_terrain_pid.py)
-        self.sim.dt = 1.0 / 120.0
+        self.sim.dt = 1.0 / 60.0
         # 10Hz navigation policy (PID handles yaw at 120Hz between decisions)
-        self.decimation = 12  # 120Hz / 12 = 10Hz
+        self.decimation = 6  # 120Hz / 12 = 10Hz
+        self.episode_length_s = 60.0  # longer horizon for navigation (60s = 1min at sim_dt=1/60s)
 
         # Enable contact processing for diff-drive (base class disables it for
         # legged robots as an optimization, but wheels need proper friction solving)
         self.sim.disable_contact_processing = False
 
-        # Match test_diff_drive_simple.py / drive_terrain_pid.py friction
+        # Use average friction combine so robot-side friction randomization does
+        # not get multiplied down into overly slippery wheel-ground contact.
         self.scene.terrain.physics_material = sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="multiply",
+            friction_combine_mode="average",
             restitution_combine_mode="multiply",
             restitution=0.0,
             static_friction=1.0,
@@ -96,16 +102,38 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
             weight=10.0,
             params={"command_name": "robot_goal"},
         )
+        self.rewards.pose_goal_proximity = RewTerm(
+            func=mdp.pose_goal_proximity,
+            weight=1.0,
+            params={
+                "command_name": "robot_goal",
+                "xy_scale": 1.0,
+                "yaw_scale": math.radians(45.0),
+                "activation_xy_threshold": 0.5,
+            },
+        )
+        self.rewards.pose_goal_hold_bonus = RewTerm(
+            func=mdp.pose_goal_hold_bonus,
+            weight=2.0,
+            params={
+                "command_name": "robot_goal",
+                "xy_threshold": 0.35,
+                "yaw_threshold": math.radians(15.0),
+                "lin_speed_threshold": 0.15,
+                "yaw_rate_threshold": 0.30,
+            },
+        )
 
         # --- Terminations ---
-        # Re-enable base_contact for obstacle avoidance learning.
-        # Chassis idles at ~294N ground contact; wall collisions at speed >> 800N.
-        # Threshold 800N catches real collisions, ignores ground contact.
+        # Detect navigation collisions from horizontal normal forces on the
+        # chassis only. Ground support loads are mostly vertical, and wheel
+        # contacts are excluded from this check.
         self.terminations.base_contact.params = {
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces", body_names=["base_link"]
             ),
-            "threshold": 800.0,
+            "threshold": 50.0,
+            "horizontal_only": True,
         }
 
         # --- Events ---
@@ -113,20 +141,20 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
         # stable than a 4-legged robot, velocity impulses cause tipping/spinning.
         self.events.push_robot = None
 
-        # Narrow robot body friction randomization (base uses 0.7-1.0 dynamic
-        # which causes traction loss for 2-wheel robots)
-        self.events.physics_material.params["static_friction_range"] = (0.9, 1.1)
-        self.events.physics_material.params["dynamic_friction_range"] = (0.85, 1.0)
+        # Bypass material / friction randomization for diff-drive for now. It
+        # perturbs wheel/base friction and restitution enough to dominate
+        # controller debugging on this 2-wheel platform.
+        # To restore randomization, delete or comment out the next line
+        # (`self.events.physics_material = None`) and uncomment the parameter
+        # overrides below.
+        # self.events.physics_material.params["static_friction_range"] = (0.9, 1.1)
+        # self.events.physics_material.params["dynamic_friction_range"] = (0.85, 1.0)
+        # self.events.physics_material.params["restitution_range"] = (0.0, 0.0)
+        self.events.physics_material = None
 
-        # Low-pass filter alpha ranges for diff-drive
-        self.events.randomize_low_pass_filter_alpha.params = {
-            "alpha_range": (0.4, 0.8),
-            "action_term": "velocity_command",
-            "per_dimension": True,
-            "alpha_range_vx": (0.4, 0.8),
-            "alpha_range_vy": (0.4, 0.8),
-            "alpha_range_omega": (0.4, 0.8),
-        }
+        # The diff-drive controller uses ramp-limited commands instead of the
+        # base task's low-pass-filter randomization.
+        self.events.randomize_low_pass_filter_alpha = None
 
         # --- Terrain ---
         # Diff-drive: wider corridors (cell_size=3.0 vs B2W's 2.0) because

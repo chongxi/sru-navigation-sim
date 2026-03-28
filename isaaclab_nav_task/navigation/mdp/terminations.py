@@ -77,6 +77,7 @@ def illegal_contact_navigation(
     threshold: float,
     sensor_cfg: SceneEntityCfg,
     goal_cmd_name: str = "robot_goal",
+    horizontal_only: bool = False,
 ) -> torch.Tensor:
     """Terminate when the contact force on the sensor exceeds the force threshold."""
     from isaaclab_nav_task.navigation.mdp.navigation.goal_commands import RobotNavigationGoalCommand
@@ -85,10 +86,26 @@ def illegal_contact_navigation(
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     net_contact_forces = contact_sensor.data.net_forces_w_history
     goal_cmd_generator: RobotNavigationGoalCommand = env.command_manager._terms[goal_cmd_name]
-
-    termination = torch.any(
-        torch.max(torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1), dim=1)[0] > threshold, dim=1
-    )
+    contact_force_vectors = net_contact_forces[:, :, sensor_cfg.body_ids]
+    if horizontal_only:
+        contact_force_norms = torch.norm(contact_force_vectors[..., :2], dim=-1)
+    else:
+        contact_force_norms = torch.norm(contact_force_vectors, dim=-1)
+    contact_force_max_per_body = torch.max(contact_force_norms, dim=1)[0]
+    num_selected_bodies = contact_force_norms.shape[-1]
+    flat_contact_force_norms = contact_force_norms.reshape(contact_force_norms.shape[0], -1)
+    max_contact_indices = torch.argmax(flat_contact_force_norms, dim=1)
+    flat_contact_force_vectors = contact_force_vectors.reshape(contact_force_vectors.shape[0], -1, 3)
+    selected_body_ids = torch.as_tensor(sensor_cfg.body_ids, device=flat_contact_force_vectors.device, dtype=torch.long)
+    selected_body_index = torch.remainder(max_contact_indices, num_selected_bodies)
+    goal_cmd_generator.last_base_contact_force_w[:] = flat_contact_force_vectors[
+        torch.arange(flat_contact_force_vectors.shape[0], device=flat_contact_force_vectors.device),
+        max_contact_indices,
+    ]
+    goal_cmd_generator.last_base_contact_force_xy[:] = torch.norm(goal_cmd_generator.last_base_contact_force_w[:, :2], dim=-1)
+    goal_cmd_generator.last_base_contact_force[:] = torch.max(contact_force_max_per_body, dim=1)[0]
+    goal_cmd_generator.last_contact_body_id[:] = selected_body_ids[selected_body_index]
+    termination = torch.any(contact_force_max_per_body > threshold, dim=1)
 
     env_ids = torch.where(termination)[0]
 
@@ -115,6 +132,8 @@ def large_angle_termination_navigation(
     yaw_q = yaw_quat(robot.data.root_quat_w)
     base_quat_b = quat_mul(quat_inv(yaw_q), robot.data.root_quat_w)
     robot_roll, robot_pitch, _ = euler_xyz_from_quat_wrapped(base_quat_b)
+    goal_cmd_generator.last_roll[:] = robot_roll
+    goal_cmd_generator.last_pitch[:] = robot_pitch
 
     termination = torch.logical_or(torch.abs(robot_pitch) > threshold_rad, torch.abs(robot_roll) > threshold_rad)
 
@@ -152,15 +171,11 @@ def at_goal_navigation(
     # Calculate distance to goal
     xy_error = torch.norm(goal_cmd_generator._get_unscaled_command()[:, :2], dim=1)
 
-    # Check conditions for termination
+    # Require the robot to remain continuously inside the goal region. Merely
+    # touching the goal once should not guarantee termination a few seconds later.
     at_goal = xy_error < distance_threshold
-
-    # already at goal
-    already_at_goal = goal_cmd_generator.time_at_goal > 0.0
-    at_goal = torch.logical_or(at_goal, already_at_goal)
-
-    # Update the time at goal in steps
-    goal_cmd_generator.time_at_goal_in_steps[at_goal] += 1  # Increment if at goal
+    goal_cmd_generator.time_at_goal_in_steps[at_goal] += 1
+    goal_cmd_generator.time_at_goal_in_steps[~at_goal] = 0
 
     # Determine if termination condition is met
     termination = goal_cmd_generator.time_at_goal_in_steps > goal_cmd_generator.required_time_at_goal_in_steps

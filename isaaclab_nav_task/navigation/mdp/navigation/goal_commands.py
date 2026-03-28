@@ -30,7 +30,9 @@ from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import (
+    BLUE_ARROW_X_MARKER_CFG,
     CUBOID_MARKER_CFG,
+    FRAME_MARKER_CFG,
     GREEN_ARROW_X_MARKER_CFG,
     RED_ARROW_X_MARKER_CFG,
 )
@@ -360,6 +362,8 @@ class RobotNavigationGoalCommand(CommandTerm):
         # Goal in body frame: [direction_x, direction_y, direction_z, log_distance]
         self.goal_command_body = torch.zeros(self.num_envs, 4, device=self.device)
         self.goal_command_body_unscaled = torch.ones(self.num_envs, 3, device=self.device)
+        self.goal_heading_world = torch.zeros(self.num_envs, device=self.device)
+        self.goal_heading_error = torch.zeros(self.num_envs, device=self.device)
 
         # World frame positions
         self.goal_position_world = torch.zeros(self.num_envs, 3, device=self.device)
@@ -387,12 +391,22 @@ class RobotNavigationGoalCommand(CommandTerm):
         self.goal_reach_count = torch.zeros(self.num_envs, device=self.device)
         self.success_tracker = SuccessRateTracker(self.num_envs, self.device, buffer_size=10)
         self.success_rate_buffer = torch.full((self.num_envs, 10), -1.0, device=self.device)
+        # Cached pre-reset diagnostics from termination checks. These let the
+        # keyboard debugger report the actual terminating pose/contact instead
+        # of the already-reset state returned by env.step().
+        self.last_roll = torch.zeros(self.num_envs, device=self.device)
+        self.last_pitch = torch.zeros(self.num_envs, device=self.device)
+        self.last_base_contact_force = torch.zeros(self.num_envs, device=self.device)
+        self.last_base_contact_force_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self.last_base_contact_force_xy = torch.zeros(self.num_envs, device=self.device)
+        self.last_contact_body_id = torch.full((self.num_envs,), -1, device=self.device, dtype=torch.long)
 
     def _init_metrics(self):
         """Initialize performance metrics."""
         self.metrics["velocity_toward_goal"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["velocity_magnitude"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["success_rate"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["heading_error_abs"] = torch.zeros(self.num_envs, device=self.device)
 
     # =========================================================================
     # Command Interface
@@ -520,6 +534,23 @@ class RobotNavigationGoalCommand(CommandTerm):
         # Sample spawn positions (from spawn_mask with larger padding for robot body)
         spawn_x, spawn_y, spawn_z = self._position_sampler.sample_spawn(terrain_indices)
 
+        # Keep spawn and goal separated enough that episodes do not instantly end at reset.
+        min_spawn_goal_distance = getattr(self.cfg, "min_spawn_goal_distance", 0.0)
+        if min_spawn_goal_distance > 0.0 and len(env_ids_tensor) > 0:
+            attempts = max(1, int(getattr(self.cfg, "spawn_goal_resample_attempts", 32)))
+            invalid = torch.sqrt((goal_x - spawn_x) ** 2 + (goal_y - spawn_y) ** 2) < min_spawn_goal_distance
+            for _ in range(attempts):
+                if not invalid.any():
+                    break
+                invalid_indices = invalid.nonzero(as_tuple=False).squeeze(-1)
+                resampled_goal_x, resampled_goal_y, resampled_goal_z = self._position_sampler.sample(
+                    terrain_indices[invalid_indices]
+                )
+                goal_x[invalid_indices] = resampled_goal_x
+                goal_y[invalid_indices] = resampled_goal_y
+                goal_z[invalid_indices] = resampled_goal_z
+                invalid = torch.sqrt((goal_x - spawn_x) ** 2 + (goal_y - spawn_y) ** 2) < min_spawn_goal_distance
+
         # Convert to world coordinates
         terrain = self.env.scene.terrain
         levels = terrain.terrain_levels[env_ids]
@@ -531,6 +562,7 @@ class RobotNavigationGoalCommand(CommandTerm):
         self.goal_position_world[env_ids, 1] = terrain_origins[:, 1] + goal_y
         height_offset = torch.rand(len(env_ids), device=self.device) * 0.6 + 0.2
         self.goal_position_world[env_ids, 2] = goal_z + height_offset
+        self.goal_heading_world[env_ids] = torch.empty(len(env_ids), device=self.device).uniform_(-math.pi, math.pi)
 
         # Small spawn height offset to prevent clipping into terrain
         # Note: The robot's default_root_state already includes standing height (~0.5m)
@@ -582,6 +614,9 @@ class RobotNavigationGoalCommand(CommandTerm):
         self.goal_command_body[:, :3] = direction
         self.goal_command_body[:, 3:] = log_distance
 
+        current_yaw = math_utils.euler_xyz_from_quat(self.robot.data.root_quat_w)[2]
+        self.goal_heading_error[:] = math_utils.wrap_to_pi(self.goal_heading_world - current_yaw)
+
         self._update_distance_tracking()
 
     def _update_distance_tracking(self):
@@ -618,6 +653,7 @@ class RobotNavigationGoalCommand(CommandTerm):
         direction_to_goal = position_error_2d / torch.clamp(torch.norm(position_error_2d, dim=1, keepdim=True), min=1e-6)
         self.metrics["velocity_toward_goal"] = (velocity_2d * direction_to_goal).sum(dim=1)
         self.metrics["success_rate"] = self.success_tracker.get_success_rate()
+        self.metrics["heading_error_abs"] = torch.abs(self.goal_heading_error)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         """Reset command generator and compute episode metrics."""
@@ -676,6 +712,13 @@ class RobotNavigationGoalCommand(CommandTerm):
             cfg.markers["cuboid"].visual_material.diffuse_color = (0.0, 0.0, 1.0)
             self.goal_marker = VisualizationMarkers(cfg)
 
+        if not hasattr(self, "goal_heading_marker"):
+            cfg = FRAME_MARKER_CFG.copy()
+            cfg.prim_path = "/Visuals/Command/goal_heading"
+            # Use a pose frame here instead of arrow_x.usd so the origin is exactly at the goal pose.
+            cfg.markers["frame"].scale = (1.05, 1.05, 1.05)
+            self.goal_heading_marker = VisualizationMarkers(cfg)
+
         if not hasattr(self, "spawn_marker"):
             cfg = CUBOID_MARKER_CFG.copy()
             cfg.prim_path = "/Visuals/Command/spawn_position"
@@ -695,33 +738,109 @@ class RobotNavigationGoalCommand(CommandTerm):
             cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)
             self.current_velocity_marker = VisualizationMarkers(cfg)
 
+        if not hasattr(self, "diff_drive_current_velocity_marker"):
+            cfg = GREEN_ARROW_X_MARKER_CFG.copy()
+            cfg.prim_path = "/Visuals/Command/diff_drive_current_velocity"
+            cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)
+            self.diff_drive_current_velocity_marker = VisualizationMarkers(cfg)
+
+        if not hasattr(self, "commanded_heading_marker"):
+            cfg = BLUE_ARROW_X_MARKER_CFG.copy()
+            cfg.prim_path = "/Visuals/Command/commanded_heading"
+            cfg.markers["arrow"].scale = (0.2, 0.2, 0.2)
+            self.commanded_heading_marker = VisualizationMarkers(cfg)
+
+        if not hasattr(self, "_show_diff_drive_current_velocity_marker"):
+            self._show_diff_drive_current_velocity_marker = True
+
         self.goal_marker.set_visibility(True)
+        self.goal_heading_marker.set_visibility(True)
         self.spawn_marker.set_visibility(True)
         self.desired_velocity_marker.set_visibility(True)
         self.current_velocity_marker.set_visibility(True)
+        self.diff_drive_current_velocity_marker.set_visibility(True)
+        self.commanded_heading_marker.set_visibility(True)
 
     def _hide_visualizers(self):
-        for name in ["goal_marker", "spawn_marker", "desired_velocity_marker", "current_velocity_marker"]:
+        for name in [
+            "goal_marker",
+            "goal_heading_marker",
+            "spawn_marker",
+            "desired_velocity_marker",
+            "current_velocity_marker",
+            "diff_drive_current_velocity_marker",
+            "commanded_heading_marker",
+        ]:
             if hasattr(self, name):
                 getattr(self, name).set_visibility(False)
 
     def _debug_vis_callback(self, event):
         """Update visualization markers."""
         self.goal_marker.visualize(self.goal_position_world)
+        goal_heading_position = self.goal_position_world.clone()
+        goal_heading_position[:, 2] += 0.12
+        half_goal_yaw = self.goal_heading_world * 0.5
+        goal_heading_quat = torch.zeros(self.num_envs, 4, device=self.device)
+        goal_heading_quat[:, 0] = torch.cos(half_goal_yaw)
+        goal_heading_quat[:, 3] = torch.sin(half_goal_yaw)
+        goal_heading_scale = torch.tensor(
+            self.goal_heading_marker.cfg.markers["frame"].scale,
+            device=self.device,
+        ).repeat(self.num_envs, 1)
+        self.goal_heading_marker.visualize(goal_heading_position, goal_heading_quat, goal_heading_scale)
         self.spawn_marker.visualize(self.spawn_position_world)
 
         arrow_position = self.robot.data.root_pos_w.clone()
         arrow_position[:, 2] += 0.5
+        commanded_heading_position = self.robot.data.root_com_pose_w[:, :3].clone()
+        commanded_heading_position[:, 2] += 0.5
 
-        desired_scale, desired_quat = self._compute_velocity_arrow(
-            self.command[:, :3], is_goal_direction=True
-        )
-        self.desired_velocity_marker.visualize(arrow_position, desired_quat, desired_scale)
+        try:
+            action_term = self.env.action_manager._terms["velocity_command"]
+            has_diff_drive_heading = hasattr(action_term, "_yaw_target") and hasattr(action_term, "_stored_vx")
+        except KeyError:
+            action_term = None
+            has_diff_drive_heading = False
 
-        current_scale, current_quat = self._compute_velocity_arrow(
-            self.robot.data.root_lin_vel_b, is_goal_direction=False
-        )
-        self.current_velocity_marker.visualize(arrow_position, current_quat, current_scale)
+        if has_diff_drive_heading:
+            self.desired_velocity_marker.set_visibility(False)
+            self.current_velocity_marker.set_visibility(False)
+            self.diff_drive_current_velocity_marker.set_visibility(self._show_diff_drive_current_velocity_marker)
+            self.commanded_heading_marker.set_visibility(True)
+
+            if self._show_diff_drive_current_velocity_marker:
+                current_scale, current_quat = self._compute_velocity_arrow(
+                    self.robot.data.root_lin_vel_b, is_goal_direction=False
+                )
+                self.diff_drive_current_velocity_marker.visualize(arrow_position, current_quat, current_scale)
+
+            yaw_target = action_term._yaw_target  # (num_envs,) world-frame angle
+            stored_vx = action_term._stored_vx    # (num_envs,)
+            half_yaw = yaw_target * 0.5
+            cmd_quat = torch.zeros(self.num_envs, 4, device=self.device)
+            cmd_quat[:, 0] = torch.cos(half_yaw)
+            cmd_quat[:, 3] = torch.sin(half_yaw)
+            cmd_scale = torch.tensor(
+                self.commanded_heading_marker.cfg.markers["arrow"].scale,
+                device=self.device
+            ).repeat(self.num_envs, 1)
+            cmd_scale[:, 0] *= 1.0 + 0.25 * torch.abs(stored_vx)
+            self.commanded_heading_marker.visualize(commanded_heading_position, cmd_quat, cmd_scale)
+        else:
+            self.desired_velocity_marker.set_visibility(True)
+            self.current_velocity_marker.set_visibility(True)
+            self.diff_drive_current_velocity_marker.set_visibility(False)
+            self.commanded_heading_marker.set_visibility(False)
+
+            desired_scale, desired_quat = self._compute_velocity_arrow(
+                self.command[:, :3], is_goal_direction=True
+            )
+            self.desired_velocity_marker.visualize(arrow_position, desired_quat, desired_scale)
+
+            current_scale, current_quat = self._compute_velocity_arrow(
+                self.robot.data.root_lin_vel_b, is_goal_direction=False
+            )
+            self.current_velocity_marker.visualize(arrow_position, current_quat, current_scale)
 
     def _compute_velocity_arrow(
         self,
@@ -730,7 +849,7 @@ class RobotNavigationGoalCommand(CommandTerm):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute arrow visualization parameters."""
         base_scale = torch.tensor(
-            self.desired_velocity_marker.cfg.markers["arrow"].scale,
+            self.current_velocity_marker.cfg.markers["arrow"].scale,
             device=self.device
         ).repeat(velocity.shape[0], 1)
 
@@ -771,6 +890,8 @@ class RobotNavigationGoalCommand(CommandTerm):
 
 RobotNavigationGoalCommand.pos_command_b = property(lambda self: self.goal_command_body)
 RobotNavigationGoalCommand.pos_command_w = property(lambda self: self.goal_position_world)
+RobotNavigationGoalCommand.heading_command_w = property(lambda self: self.goal_heading_world)
+RobotNavigationGoalCommand.heading_error_b = property(lambda self: self.goal_heading_error)
 RobotNavigationGoalCommand.pos_spawn_w = property(lambda self: self.spawn_position_world)
 RobotNavigationGoalCommand.closes_distance_to_goal = property(
     lambda self: self.closest_distance_to_goal

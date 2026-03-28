@@ -16,6 +16,7 @@ import torch
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils import math as math_utils
 
 from isaaclab_nav_task.navigation.mdp.navigation.goal_commands import RobotNavigationGoalCommand
 
@@ -152,3 +153,57 @@ def backward_movement_penalty(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg 
     # Only penalize negative forward velocity (backward movement)
     backward_velocity = torch.clamp(-forward_velocity, min=0.0, max=1.0)
     return backward_velocity
+
+
+def pose_goal_hold_bonus(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    xy_threshold: float,
+    yaw_threshold: float,
+    lin_speed_threshold: float,
+    yaw_rate_threshold: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Constant per-step bonus for being at the target pose and nearly stationary."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    goal_cmd: RobotNavigationGoalCommand = env.command_manager._terms[command_name]
+
+    xy_error = torch.norm(asset.data.root_pos_w[:, :2] - goal_cmd.pos_command_w[:, :2], dim=1)
+    current_yaw = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)[2]
+    yaw_error = torch.abs(math_utils.wrap_to_pi(goal_cmd.goal_heading_world - current_yaw))
+    lin_speed = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    yaw_rate = torch.abs(asset.data.root_ang_vel_b[:, 2])
+
+    in_pose = torch.logical_and(xy_error < xy_threshold, yaw_error < yaw_threshold)
+    settled = torch.logical_and(lin_speed < lin_speed_threshold, yaw_rate < yaw_rate_threshold)
+    return torch.logical_and(in_pose, settled).float()
+
+
+def pose_goal_proximity(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    xy_scale: float,
+    yaw_scale: float,
+    activation_xy_threshold: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Smooth dense reward for approaching the target pose.
+
+    The reward is high only when both the XY position error and the yaw error
+    are small, but it stays dense everywhere so the policy gets directional
+    signal before it reaches the final pose.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    goal_cmd: RobotNavigationGoalCommand = env.command_manager._terms[command_name]
+
+    xy_error = torch.norm(asset.data.root_pos_w[:, :2] - goal_cmd.pos_command_w[:, :2], dim=1)
+    current_yaw = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)[2]
+    yaw_error = torch.abs(math_utils.wrap_to_pi(goal_cmd.goal_heading_world - current_yaw))
+
+    xy_scale = max(float(xy_scale), 1.0e-6)
+    yaw_scale = max(float(yaw_scale), 1.0e-6)
+
+    xy_score = 1.0 / (1.0 + torch.square(xy_error / xy_scale))
+    yaw_score = 1.0 / (1.0 + torch.square(yaw_error / yaw_scale))
+    active = xy_error < float(activation_xy_threshold)
+    return xy_score * yaw_score * active.float()

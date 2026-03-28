@@ -54,7 +54,12 @@ parser.add_argument("--wheel_track", type=float, default=0.56, help="Distance be
 
 # Drive arguments
 parser.add_argument("--linear_speed", type=float, default=2.5, help="Forward/backward speed (m/s).")
-parser.add_argument("--yaw_speed", type=float, default=10.0, help="Yaw rate (rad/s).")
+parser.add_argument(
+    "--yaw_speed",
+    type=float,
+    default=10.0,
+    help="Yaw target slew rate (rad/s) commanded by keyboard left/right.",
+)
 parser.add_argument("--settle_time", type=float, default=0.5, help="Settle time after reset (s).")
 parser.add_argument("--command_ramp_up_time", type=float, default=0.8, help="Ramp-up time constant (s).")
 parser.add_argument("--command_ramp_down_time", type=float, default=0.15, help="Ramp-down time constant (s).")
@@ -88,19 +93,23 @@ simulation_app = app_launcher.app
 import torch
 
 import isaaclab.sim as sim_utils
+import isaaclab.utils.math as math_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.assets.articulation import Articulation, ArticulationCfg
 from isaaclab.devices import Se2Keyboard, Se2KeyboardCfg
+from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
-from isaaclab.utils.math import euler_xyz_from_quat
+from isaaclab.utils.math import euler_xyz_from_quat, yaw_quat
 
 # Apply terrain patches (mesh optimisation + height-field mask storage)
 from isaaclab_nav_task.terrains.patches import apply_terrain_patches
 apply_terrain_patches()
 
+from isaaclab_nav_task.navigation.mdp.math_utils import vec_to_quat
 from isaaclab_nav_task.terrains import HfMazeTerrainCfg
 
 
@@ -243,6 +252,14 @@ def quat_yaw(quat_wxyz: torch.Tensor) -> torch.Tensor:
     return euler_xyz_from_quat(quat_wxyz)[2]
 
 
+def wrap_to_pi(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def wrap_to_pi_tensor(angle: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
 def ramp_command(current: float, target: float, dt: float, ramp_up: float, ramp_down: float) -> float:
     ramp_time = ramp_up if abs(target) > abs(current) else ramp_down
     if ramp_time <= 0.0:
@@ -251,15 +268,26 @@ def ramp_command(current: float, target: float, dt: float, ramp_up: float, ramp_
     return current + alpha * (target - current)
 
 
-def wrap_to_pi(angle: float) -> float:
-    return math.atan2(math.sin(angle), math.cos(angle))
-
-
 def low_pass_filter(current: float, measurement: float, dt: float, tau: float) -> float:
     if tau <= 0.0:
         return measurement
     alpha = min(1.0, dt / tau)
     return current + alpha * (measurement - current)
+
+
+def compute_current_velocity_arrow(
+    root_lin_vel_b: torch.Tensor,
+    root_quat_w: torch.Tensor,
+    marker_scale: tuple[float, float, float],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match the task's current-velocity visualization in world frame."""
+    velocity = root_lin_vel_b.clone()
+    velocity[:, 2] = 0.0
+    scale = torch.tensor(marker_scale, device=velocity.device).repeat(velocity.shape[0], 1)
+    scale[:, 0] *= torch.norm(velocity, dim=1) * 3.0
+    quat = vec_to_quat(velocity)
+    quat = math_utils.quat_mul(yaw_quat(root_quat_w), quat)
+    return scale, quat
 
 
 def reset_robot(scene: InteractiveScene, keyboard: Se2Keyboard) -> None:
@@ -280,7 +308,7 @@ def reset_robot(scene: InteractiveScene, keyboard: Se2Keyboard) -> None:
 # ── Main loop ─────────────────────────────────────────────────────────
 
 def main() -> None:
-    # Simulation context — 200 Hz physics for smooth wheel-on-mesh contact
+    # Simulation context — 120 Hz physics to match the diff-drive task config
     sim_cfg = sim_utils.SimulationCfg(
         device=args_cli.device,
         dt=1 / 120.0,
@@ -303,6 +331,22 @@ def main() -> None:
     if len(wheel_joint_ids) != 2:
         raise RuntimeError(f"Expected 2 wheel joints, found {wheel_joint_names}.")
 
+    # Keep the task's wheel-level PID and visualization, but use the original
+    # keyboard yaw-target integrator so the base can pivot in place.
+    max_wheel_velocity = 25.0
+    half_track = 0.5 * args_cli.wheel_track
+
+    # Visualization markers mirroring the task's command arrows.
+    commanded_heading_cfg = BLUE_ARROW_X_MARKER_CFG.copy()
+    commanded_heading_cfg.prim_path = "/Visuals/Command/commanded_heading"
+    commanded_heading_cfg.markers["arrow"].scale = (0.5, 0.3, 0.3)
+    commanded_heading_marker = VisualizationMarkers(commanded_heading_cfg)
+
+    current_velocity_cfg = GREEN_ARROW_X_MARKER_CFG.copy()
+    current_velocity_cfg.prim_path = "/Visuals/Command/current_velocity"
+    current_velocity_cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)
+    current_velocity_marker = VisualizationMarkers(current_velocity_cfg)
+
     # Keyboard
     keyboard = DifferentialDriveKeyboard(
         Se2KeyboardCfg(
@@ -313,24 +357,27 @@ def main() -> None:
         )
     )
 
-    # PID state
+    # Target-yaw controller state
+    num_envs = scene.num_envs
+    device = robot.device
+    settle_timer = max(0.0, args_cli.settle_time)
     filtered_v_x = 0.0
     filtered_omega_z = 0.0
-    settle_timer = max(0.0, args_cli.settle_time)
-    yaw_target: float | None = None
-    yaw_error_integral = 0.0
-    filtered_yaw_rate = 0.0
+    stored_vx = torch.zeros(num_envs, device=device)
+    yaw_target = torch.zeros(num_envs, device=device)
+    yaw_error_integral = torch.zeros(num_envs, device=device)
+    filtered_yaw_rate = torch.zeros(num_envs, device=device)
 
     def handle_reset() -> None:
-        nonlocal filtered_v_x, filtered_omega_z, settle_timer
-        nonlocal yaw_target, yaw_error_integral, filtered_yaw_rate
+        nonlocal settle_timer, filtered_v_x, filtered_omega_z, filtered_yaw_rate
         reset_robot(scene, keyboard)
+        settle_timer = max(0.0, args_cli.settle_time)
         filtered_v_x = 0.0
         filtered_omega_z = 0.0
-        settle_timer = max(0.0, args_cli.settle_time)
-        yaw_target = None
-        yaw_error_integral = 0.0
-        filtered_yaw_rate = 0.0
+        stored_vx.zero_()
+        yaw_target.zero_()
+        yaw_error_integral.zero_()
+        filtered_yaw_rate.zero_()
 
     keyboard.add_callback("R", handle_reset)
 
@@ -367,8 +414,8 @@ def main() -> None:
             command = keyboard.advance()
             raw_v_x = float(command[0].item())
             raw_omega_z = float(command[2].item())
-            current_yaw = float(quat_yaw(robot.data.root_quat_w[0:1])[0].item())
-            current_yaw_rate = float(robot.data.root_ang_vel_b[0, 2].item())
+            current_yaw = quat_yaw(robot.data.root_quat_w)
+            current_yaw_rate = robot.data.root_ang_vel_b[:, 2]
             filtered_yaw_rate = low_pass_filter(
                 filtered_yaw_rate, current_yaw_rate, sim_dt, args_cli.yaw_rate_filter_time
             )
@@ -377,85 +424,110 @@ def main() -> None:
                 settle_timer = max(0.0, settle_timer - sim_dt)
                 filtered_v_x = 0.0
                 filtered_omega_z = 0.0
-                v_x = 0.0
-                commanded_omega_z = 0.0
-                yaw_target = current_yaw
-                yaw_error_integral = 0.0
-                filtered_yaw_rate = 0.0
+                stored_vx.zero_()
+                yaw_target.copy_(current_yaw)
+                yaw_error_integral.zero_()
+                filtered_yaw_rate.zero_()
             else:
                 filtered_v_x = ramp_command(
-                    filtered_v_x, raw_v_x, sim_dt,
-                    args_cli.command_ramp_up_time, args_cli.command_ramp_down_time,
+                    filtered_v_x,
+                    raw_v_x,
+                    sim_dt,
+                    args_cli.command_ramp_up_time,
+                    args_cli.command_ramp_down_time,
                 )
                 filtered_omega_z = ramp_command(
-                    filtered_omega_z, raw_omega_z, sim_dt,
-                    args_cli.command_ramp_up_time, args_cli.command_ramp_down_time,
+                    filtered_omega_z,
+                    raw_omega_z,
+                    sim_dt,
+                    args_cli.command_ramp_up_time,
+                    args_cli.command_ramp_down_time,
                 )
-                v_x = filtered_v_x
+                stored_vx.fill_(filtered_v_x)
 
                 manual_yaw_active = abs(filtered_omega_z) > 1e-4
-                moving_command_active = abs(filtered_v_x) > args_cli.yaw_hold_engage_speed
-
-                if yaw_target is None:
-                    yaw_target = current_yaw
-
                 if manual_yaw_active:
-                    yaw_target = wrap_to_pi(yaw_target + filtered_omega_z * sim_dt)
-                    yaw_error_integral = 0.0
-                elif not moving_command_active:
-                    yaw_error_integral = 0.0
+                    yaw_target.copy_(
+                        wrap_to_pi_tensor(
+                            yaw_target + torch.full_like(yaw_target, filtered_omega_z * sim_dt)
+                        )
+                    )
 
-                yaw_error = wrap_to_pi(yaw_target - current_yaw)
-                yaw_error_integral += yaw_error * sim_dt
-                yaw_error_integral = max(
-                    -args_cli.yaw_pid_integral_limit,
-                    min(args_cli.yaw_pid_integral_limit, yaw_error_integral),
-                )
-                pid_correction = (
-                    args_cli.yaw_pid_kp * yaw_error
-                    + args_cli.yaw_pid_ki * yaw_error_integral
-                    - args_cli.yaw_pid_kd * filtered_yaw_rate
-                )
-                pid_correction = max(
-                    -args_cli.yaw_hold_max_correction,
-                    min(args_cli.yaw_hold_max_correction, pid_correction),
-                )
+            yaw_error = wrap_to_pi_tensor(yaw_target - current_yaw)
+            yaw_error_integral += yaw_error * sim_dt
+            yaw_error_integral.clamp_(
+                -args_cli.yaw_pid_integral_limit, args_cli.yaw_pid_integral_limit
+            )
 
-                if moving_command_active or manual_yaw_active:
-                    commanded_omega_z = pid_correction
-                else:
-                    commanded_omega_z = 0.0
+            commanded_omega_z = (
+                args_cli.yaw_pid_kp * yaw_error
+                + args_cli.yaw_pid_ki * yaw_error_integral
+                - args_cli.yaw_pid_kd * filtered_yaw_rate
+            )
+            commanded_omega_z.clamp_(
+                -args_cli.yaw_hold_max_correction, args_cli.yaw_hold_max_correction
+            )
 
             # Differential-drive kinematics
-            left_w = (v_x - 0.5 * args_cli.wheel_track * commanded_omega_z) / args_cli.wheel_radius
-            right_w = (v_x + 0.5 * args_cli.wheel_track * commanded_omega_z) / args_cli.wheel_radius
+            left_w = (stored_vx - half_track * commanded_omega_z) / args_cli.wheel_radius
+            right_w = (stored_vx + half_track * commanded_omega_z) / args_cli.wheel_radius
+            left_w.clamp_(-max_wheel_velocity, max_wheel_velocity)
+            right_w.clamp_(-max_wheel_velocity, max_wheel_velocity)
 
-            wheel_targets = torch.tensor(
-                [[left_w, right_w]], dtype=torch.float32, device=args_cli.device
-            ).repeat(scene.num_envs, 1)
+            wheel_targets = torch.stack([left_w, right_w], dim=-1)
 
             robot.set_joint_velocity_target(wheel_targets, joint_ids=wheel_joint_ids)
             scene.write_data_to_sim()
             sim.step()
             scene.update(sim_dt)
 
+            # Match the task's command visualizers with local labels/colors.
+            arrow_position = robot.data.root_pos_w.clone()
+            arrow_position[:, 2] += 0.5
+
+            half_yaw = yaw_target * 0.5
+            commanded_heading_quat = torch.zeros(num_envs, 4, device=device)
+            commanded_heading_quat[:, 0] = torch.cos(half_yaw)
+            commanded_heading_quat[:, 3] = torch.sin(half_yaw)
+            commanded_heading_scale = torch.tensor(
+                commanded_heading_marker.cfg.markers["arrow"].scale, device=device
+            ).repeat(num_envs, 1)
+            commanded_heading_scale[:, 0] *= 1.0 + 0.5 * torch.abs(stored_vx)
+            commanded_heading_marker.visualize(
+                arrow_position, commanded_heading_quat, commanded_heading_scale
+            )
+
+            current_velocity_scale, current_velocity_quat = compute_current_velocity_arrow(
+                robot.data.root_lin_vel_b,
+                robot.data.root_quat_w,
+                current_velocity_marker.cfg.markers["arrow"].scale,
+            )
+            current_velocity_marker.visualize(
+                arrow_position, current_velocity_quat, current_velocity_scale
+            )
+
             # Debug output
             if args_cli.debug_drive:
                 debug_step += 1
-                command_active = abs(raw_v_x) > 1e-4 or abs(raw_omega_z) > 1e-4 or settle_timer > 0.0
+                command_active = (
+                    abs(raw_v_x) > 1e-4
+                    or abs(raw_omega_z) > 1e-4
+                    or settle_timer > 0.0
+                )
                 if command_active and debug_step % debug_every == 0:
                     measured_joint_vel = robot.data.joint_vel[0, wheel_joint_ids]
                     root_lin_vel = robot.data.root_lin_vel_b[0]
                     root_ang_vel = robot.data.root_ang_vel_b[0]
                     yaw_after = float(quat_yaw(robot.data.root_quat_w[0:1])[0].item())
-                    yaw_t = current_yaw if yaw_target is None else yaw_target
+                    yaw_t = float(yaw_target[0].item())
                     yaw_err = wrap_to_pi(yaw_t - yaw_after)
                     print(
                         "[DEBUG] "
                         f"raw(vx={raw_v_x:+.3f}, wz={raw_omega_z:+.3f}) "
-                        f"filt(vx={v_x:+.3f}, wz={filtered_omega_z:+.3f}) "
-                        f"yaw_tgt={yaw_t:+.3f} err={yaw_err:+.3f} corr={commanded_omega_z:+.3f} "
-                        f"w_tgt=({left_w:+.1f},{right_w:+.1f}) "
+                        f"filt(vx={filtered_v_x:+.3f}, wz={filtered_omega_z:+.3f}) "
+                        f"stored_vx={stored_vx[0].item():+.3f} "
+                        f"yaw_tgt={yaw_t:+.3f} err={yaw_err:+.3f} corr={commanded_omega_z[0].item():+.3f} "
+                        f"w_tgt=({left_w[0].item():+.1f},{right_w[0].item():+.1f}) "
                         f"w_meas=({measured_joint_vel[0].item():+.1f},{measured_joint_vel[1].item():+.1f}) "
                         f"vel=({root_lin_vel[0].item():+.2f},{root_lin_vel[1].item():+.2f}) "
                         f"yaw={yaw_after:+.3f}"

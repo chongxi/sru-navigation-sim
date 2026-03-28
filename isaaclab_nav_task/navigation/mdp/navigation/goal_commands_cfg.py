@@ -32,3 +32,11 @@ class RobotNavigationGoalCommandCfg(CommandTermCfg):
     robot_to_goal_line_vis: bool = True
     """If true, visualize the line from the robot to the goal."""
 
+    min_spawn_goal_distance: float = 0.0
+    """Minimum XY distance in meters between sampled spawn and goal positions.
+
+    Set to zero to disable the constraint.
+    """
+
+    spawn_goal_resample_attempts: int = 32
+    """Maximum number of rejection-sampling attempts for enforcing spawn-goal separation."""
