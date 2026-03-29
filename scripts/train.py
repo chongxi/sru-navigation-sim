@@ -44,6 +44,15 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--run_name", type=str, default=None, help="Name of the wandb run (appended to log directory).")
+parser.add_argument(
+    "--staggered_reset_buckets",
+    type=int,
+    default=0,
+    help=(
+        "Number of rollout-phase buckets for startup staggered resets. "
+        "Set to 0 or 1 to disable and keep the old random episode-length initialization."
+    ),
+)
 
 # Terrain arguments
 parser.add_argument("--terrain_rows", type=int, default=None, help="Terrain grid rows (difficulty levels).")
@@ -191,7 +200,11 @@ def main():
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
     # Run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    runner.learn(
+        num_learning_iterations=agent_cfg.max_iterations,
+        init_at_random_ep_len=True,
+        staggered_reset_buckets=args_cli.staggered_reset_buckets,
+    )
 
     # Close the environment
     env.close()

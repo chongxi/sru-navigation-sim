@@ -41,6 +41,15 @@ parser.add_argument(
 )
 parser.add_argument("--run_name", type=str, default=None, help="Name appended to the log directory.")
 parser.add_argument(
+    "--staggered_reset_buckets",
+    type=int,
+    default=0,
+    help=(
+        "Number of rollout-phase buckets for startup staggered resets. "
+        "Set to 0 or 1 to disable and keep the old random episode-length initialization."
+    ),
+)
+parser.add_argument(
     "--learning_rate",
     type=float,
     default=None,
@@ -94,6 +103,12 @@ parser.add_argument(
 )
 parser.add_argument(
     "--pose_goal_hold_bonus_weight", type=float, default=None, help="Override pose_goal_hold_bonus weight."
+)
+parser.add_argument(
+    "--reach_goal_xy_soft_weight", type=float, default=None, help="Override reach_goal_xy_soft weight."
+)
+parser.add_argument(
+    "--reach_goal_xy_tight_weight", type=float, default=None, help="Override reach_goal_xy_tight weight."
 )
 parser.add_argument(
     "--episode_termination_weight",
@@ -245,6 +260,10 @@ def _apply_second_stage_overrides(env_cfg) -> None:
         env_cfg.rewards.pose_goal_proximity.weight = args_cli.pose_goal_proximity_weight
     if args_cli.pose_goal_hold_bonus_weight is not None and hasattr(env_cfg.rewards, "pose_goal_hold_bonus"):
         env_cfg.rewards.pose_goal_hold_bonus.weight = args_cli.pose_goal_hold_bonus_weight
+    if args_cli.reach_goal_xy_soft_weight is not None and hasattr(env_cfg.rewards, "reach_goal_xy_soft"):
+        env_cfg.rewards.reach_goal_xy_soft.weight = args_cli.reach_goal_xy_soft_weight
+    if args_cli.reach_goal_xy_tight_weight is not None and hasattr(env_cfg.rewards, "reach_goal_xy_tight"):
+        env_cfg.rewards.reach_goal_xy_tight.weight = args_cli.reach_goal_xy_tight_weight
     if args_cli.episode_termination_weight is not None and hasattr(env_cfg.rewards, "episode_termination"):
         env_cfg.rewards.episode_termination.weight = args_cli.episode_termination_weight
     if args_cli.terrain_fall_penalty_weight is not None and hasattr(env_cfg.rewards, "terrain_fall_penalty"):
@@ -328,7 +347,11 @@ def main():
         runner.current_learning_iteration = 0
         print("[INFO] Reset learning iteration counter to 0 for second-stage logging.")
 
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    runner.learn(
+        num_learning_iterations=agent_cfg.max_iterations,
+        init_at_random_ep_len=True,
+        staggered_reset_buckets=args_cli.staggered_reset_buckets,
+    )
     env.close()
 
 
