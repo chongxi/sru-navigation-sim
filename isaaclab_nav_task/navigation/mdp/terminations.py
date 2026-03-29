@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_inv, yaw_quat, quat_mul, euler_xyz_from_quat
+from isaaclab.utils.math import quat_inv, yaw_quat, quat_mul, euler_xyz_from_quat, wrap_to_pi
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -41,10 +41,41 @@ def euler_xyz_from_quat_wrapped(quat: torch.Tensor) -> tuple[torch.Tensor, torch
     return roll, pitch, yaw
 
 
+def _goal_pose_mask(
+    asset: Articulation,
+    goal_cmd_generator: "RobotNavigationGoalCommand",
+    distance_threshold: float,
+    yaw_threshold: float | None = None,
+    lin_speed_threshold: float | None = None,
+    yaw_rate_threshold: float | None = None,
+) -> torch.Tensor:
+    """Return a boolean mask for being close enough to the target pose."""
+    xy_error = torch.norm(asset.data.root_pos_w[:, :2] - goal_cmd_generator.pos_command_w[:, :2], dim=1)
+    at_goal = xy_error < distance_threshold
+
+    if yaw_threshold is not None:
+        current_yaw = euler_xyz_from_quat(asset.data.root_quat_w)[2]
+        yaw_error = torch.abs(wrap_to_pi(goal_cmd_generator.goal_heading_world - current_yaw))
+        at_goal = torch.logical_and(at_goal, yaw_error < float(yaw_threshold))
+
+    if lin_speed_threshold is not None:
+        lin_speed = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+        at_goal = torch.logical_and(at_goal, lin_speed < float(lin_speed_threshold))
+
+    if yaw_rate_threshold is not None:
+        yaw_rate = torch.abs(asset.data.root_ang_vel_b[:, 2])
+        at_goal = torch.logical_and(at_goal, yaw_rate < float(yaw_rate_threshold))
+
+    return at_goal
+
+
 def time_out_navigation(
     env: "ManagerBasedRLEnv",
     goal_cmd_name: str = "robot_goal",
-    distance_threshold: float = 0.5
+    distance_threshold: float = 0.5,
+    yaw_threshold: float | None = None,
+    lin_speed_threshold: float | None = None,
+    yaw_rate_threshold: float | None = None,
 ) -> torch.Tensor:
     """Terminate the episode when the episode length exceeds the maximum episode length.
 
@@ -53,19 +84,27 @@ def time_out_navigation(
     from isaaclab_nav_task.navigation.mdp.navigation.goal_commands import RobotNavigationGoalCommand
 
     goal_cmd_generator: RobotNavigationGoalCommand = env.command_manager._terms[goal_cmd_name]
+    asset: Articulation = env.scene["robot"]
+    at_goal = _goal_pose_mask(
+        asset,
+        goal_cmd_generator,
+        distance_threshold=distance_threshold,
+        yaw_threshold=yaw_threshold,
+        lin_speed_threshold=lin_speed_threshold,
+        yaw_rate_threshold=yaw_rate_threshold,
+    )
+    goal_cmd_generator.time_at_goal[at_goal] += env.step_dt
+    goal_cmd_generator.time_at_goal[~at_goal] = 0.0
 
     termination = env.episode_length_buf >= env.max_episode_length
 
     env_ids = torch.where(termination)[0]
 
-    distance_goal = torch.norm(goal_cmd_generator._get_unscaled_command()[:, :2], dim=1)
-
-    # update time at goal
-    goal_cmd_generator.time_at_goal[distance_goal < distance_threshold] += 1 * env.step_dt
-
     if env_ids.numel() > 0:  # Check if env_ids is not empty
-        success_masks = goal_cmd_generator.time_at_goal > 0.0
-        value_buffer = torch.zeros_like(distance_goal)  # init with 0: Fail
+        success_masks = goal_cmd_generator.time_at_goal >= (
+            goal_cmd_generator.required_time_at_goal_in_steps * env.step_dt
+        )
+        value_buffer = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
         value_buffer[success_masks] = 1.0  # Success
         goal_cmd_generator.goal_reached_buffer.add(value_buffer, env_ids)
 
@@ -150,6 +189,9 @@ def at_goal_navigation(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     distance_threshold: float = 0.5,
     goal_cmd_name: str = "robot_goal",
+    yaw_threshold: float | None = None,
+    lin_speed_threshold: float | None = None,
+    yaw_rate_threshold: float | None = None,
 ) -> torch.Tensor:
     """Terminate the episode when the goal is reached.
 
@@ -168,12 +210,16 @@ def at_goal_navigation(
     asset: Articulation = env.scene[asset_cfg.name]
     goal_cmd_generator: RobotNavigationGoalCommand = env.command_manager._terms.get(goal_cmd_name)
 
-    # Calculate distance to goal
-    xy_error = torch.norm(goal_cmd_generator._get_unscaled_command()[:, :2], dim=1)
-
     # Require the robot to remain continuously inside the goal region. Merely
     # touching the goal once should not guarantee termination a few seconds later.
-    at_goal = xy_error < distance_threshold
+    at_goal = _goal_pose_mask(
+        asset,
+        goal_cmd_generator,
+        distance_threshold=distance_threshold,
+        yaw_threshold=yaw_threshold,
+        lin_speed_threshold=lin_speed_threshold,
+        yaw_rate_threshold=yaw_rate_threshold,
+    )
     goal_cmd_generator.time_at_goal_in_steps[at_goal] += 1
     goal_cmd_generator.time_at_goal_in_steps[~at_goal] = 0
 

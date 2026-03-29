@@ -477,12 +477,17 @@ def maze_terrain(difficulty: float, cfg: "hf_terrains_maze_cfg.HfMazeTerrainCfg"
             padding_cells=PADDING.HEIGHT_TRANSITION_PADDING
         )
 
-    # Apply safety padding and border exclusion
-    terrain.apply_padding(PADDING.GOAL_PADDING)
+    # Apply safety padding and border exclusion.
+    goal_padding_cells = int(cfg.goal_padding_cells) if cfg.goal_padding_cells is not None else PADDING.GOAL_PADDING
+    spawn_padding_cells = (
+        int(cfg.spawn_padding_cells) if cfg.spawn_padding_cells is not None else PADDING.SPAWN_PADDING
+    )
+
+    terrain.apply_padding(goal_padding_cells)
     terrain.exclude_borders(PADDING.BORDER_CELLS)
 
     # Create spawn mask with larger padding
-    spawn_mask = terrain.create_spawn_mask(PADDING.SPAWN_PADDING)
+    spawn_mask = terrain.create_spawn_mask(spawn_padding_cells)
     spawn_mask[:PADDING.BORDER_CELLS, :] = False
     spawn_mask[-PADDING.BORDER_CELLS:, :] = False
     spawn_mask[:, :PADDING.BORDER_CELLS] = False

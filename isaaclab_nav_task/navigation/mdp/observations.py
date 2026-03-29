@@ -356,6 +356,43 @@ def generated_commands_reshaped_delayed(
     return env.delay_manager.compute_delayed_target_position(command)
 
 
+def goal_heading_error(
+    env: ManagerBasedRLEnv,
+    command_name: str = "robot_goal",
+) -> torch.Tensor:
+    """Target heading error in the robot frame."""
+    goal_cmd_generator: RobotNavigationGoalCommand = env.command_manager._terms[command_name]
+    return goal_cmd_generator.heading_error_b.unsqueeze(-1)
+
+
+def goal_heading_error_trig(
+    env: ManagerBasedRLEnv,
+    command_name: str = "robot_goal",
+) -> torch.Tensor:
+    """Target heading error encoded as [cos(err), sin(err)]."""
+    goal_cmd_generator: RobotNavigationGoalCommand = env.command_manager._terms[command_name]
+    heading_error = goal_cmd_generator.heading_error_b
+    return torch.stack((torch.cos(heading_error), torch.sin(heading_error)), dim=-1)
+
+
+def goal_heading_error_delayed(
+    env: ManagerBasedRLEnv,
+    command_name: str = "robot_goal",
+) -> torch.Tensor:
+    """Target heading error with observation delay applied."""
+    heading_error = goal_heading_error(env, command_name=command_name)
+    return env.delay_manager.compute_delayed_target_heading(heading_error)
+
+
+def goal_heading_error_trig_delayed(
+    env: ManagerBasedRLEnv,
+    command_name: str = "robot_goal",
+) -> torch.Tensor:
+    """Delayed target heading encoded as [cos(err), sin(err)]."""
+    heading_error = goal_heading_error_trig(env, command_name=command_name)
+    return env.delay_manager.compute_delayed_target_heading(heading_error)
+
+
 def last_low_level_action(
     env: ManagerBasedEnv, action_term: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -472,6 +509,9 @@ def in_goal(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     distance_threshold: float = 0.5,
     goal_cmd_name: str = "robot_goal",
+    yaw_threshold: float | None = None,
+    lin_speed_threshold: float | None = None,
+    yaw_rate_threshold: float | None = None,
 ) -> torch.Tensor:
     """Check if the robot is within the goal distance threshold.
 
@@ -486,8 +526,22 @@ def in_goal(
     """
     asset: Articulation = env.scene[asset_cfg.name]
     goal_cmd_generator: RobotNavigationGoalCommand = env.command_manager._terms[goal_cmd_name]
-    distance_goal = torch.norm(asset.data.root_pos_w[:, :2] - goal_cmd_generator.pos_command_w[:, :2], dim=1, p=2)
-    return distance_goal < distance_threshold
+    xy_error = torch.norm(asset.data.root_pos_w[:, :2] - goal_cmd_generator.pos_command_w[:, :2], dim=1, p=2)
+    in_goal_mask = xy_error < distance_threshold
+
+    if yaw_threshold is not None:
+        yaw_error = torch.abs(goal_cmd_generator.heading_error_b)
+        in_goal_mask = torch.logical_and(in_goal_mask, yaw_error < float(yaw_threshold))
+
+    if lin_speed_threshold is not None:
+        lin_speed = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+        in_goal_mask = torch.logical_and(in_goal_mask, lin_speed < float(lin_speed_threshold))
+
+    if yaw_rate_threshold is not None:
+        yaw_rate = torch.abs(asset.data.root_ang_vel_b[:, 2])
+        in_goal_mask = torch.logical_and(in_goal_mask, yaw_rate < float(yaw_rate_threshold))
+
+    return in_goal_mask
 
 
 def time_normalized(env: ManagerBasedRLEnv, command_name: str = "robot_goal") -> torch.Tensor:

@@ -69,6 +69,12 @@ class HfMazeTerrainCfg(HfTerrainBaseCfg):
     wall_height: float = 1.5
     """Height of the walls (in meters). Defaults to 1.5."""
 
+    goal_padding_cells: int | None = None
+    """Optional obstacle padding for valid goal cells, in height-field cells."""
+
+    spawn_padding_cells: int | None = None
+    """Optional obstacle padding for valid spawn cells, in height-field cells."""
+
     # =========================================================================
     # Terrain Features
     # =========================================================================
@@ -107,5 +113,4 @@ class HfMazeTerrainCfg(HfTerrainBaseCfg):
     Set by the terrain generator (patches.py) before calling the terrain function.
     If None, will create a new unseeded generator (non-reproducible).
     """
-
 

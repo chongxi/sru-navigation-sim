@@ -37,6 +37,9 @@ class ObservationDelayManagerCfg:
     max_delay_target_position: int = 2
     """Maximum delay in timesteps for target position/goal observations."""
 
+    max_delay_target_heading: int = 2
+    """Maximum delay in timesteps for target heading observations."""
+
     max_delay_depth: int = 2
     """Maximum delay in timesteps for depth image observations."""
 
@@ -129,6 +132,7 @@ class ObservationDelayManager:
             self._delay_ang_vel: DelayBufferState | None = None
             self._delay_projected_gravity: DelayBufferState | None = None
             self._delay_target_position: DelayBufferState | None = None
+            self._delay_target_heading: DelayBufferState | None = None
             self._delay_depth_buffers: dict[str, DelayBufferState] = {}
             self._max_delay_depth = 0
             return
@@ -138,6 +142,7 @@ class ObservationDelayManager:
         self._delay_ang_vel = self._create_delay_buffer_state(self.cfg.max_delay_ang_vel)
         self._delay_projected_gravity = self._create_delay_buffer_state(self.cfg.max_delay_projected_gravity)
         self._delay_target_position = self._create_delay_buffer_state(self.cfg.max_delay_target_position)
+        self._delay_target_heading = self._create_delay_buffer_state(self.cfg.max_delay_target_heading)
         # Depth buffers are created dynamically per camera
         self._delay_depth_buffers: dict[str, DelayBufferState] = {}
         self._max_delay_depth = self.cfg.max_delay_depth
@@ -176,6 +181,8 @@ class ObservationDelayManager:
             self._delay_projected_gravity.reset(env_ids_list)
         if self._delay_target_position is not None:
             self._delay_target_position.reset(env_ids_list)
+        if self._delay_target_heading is not None:
+            self._delay_target_heading.reset(env_ids_list)
 
         # Reset all depth buffers
         for depth_buffer in self._delay_depth_buffers.values():
@@ -195,6 +202,8 @@ class ObservationDelayManager:
             self._delay_projected_gravity.randomize_lags(env_ids, self.device)
         if self._delay_target_position is not None:
             self._delay_target_position.randomize_lags(env_ids, self.device)
+        if self._delay_target_heading is not None:
+            self._delay_target_heading.randomize_lags(env_ids, self.device)
 
         # Randomize all depth buffers
         for depth_buffer in self._delay_depth_buffers.values():
@@ -255,6 +264,19 @@ class ObservationDelayManager:
         if self._delay_target_position is None:
             return target_position
         return self._delay_target_position.compute(target_position)
+
+    def compute_delayed_target_heading(self, target_heading: torch.Tensor) -> torch.Tensor:
+        """Compute delayed target heading observation.
+
+        Args:
+            target_heading: Current target heading tensor.
+
+        Returns:
+            Delayed target heading, or original if delays disabled.
+        """
+        if self._delay_target_heading is None:
+            return target_heading
+        return self._delay_target_heading.compute(target_heading)
 
     def compute_delayed_depth(self, depth_features: torch.Tensor, camera_name: str) -> torch.Tensor:
         """Compute delayed depth observation for a specific camera.

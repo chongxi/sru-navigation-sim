@@ -9,6 +9,7 @@ import math
 
 import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 
 from isaaclab_nav_task.navigation.navigation_env_cfg import NavigationEnvCfg
@@ -95,8 +96,21 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
         }
         # Reduce action_rate penalty to encourage exploration
         self.rewards.action_rate_l1.weight = -0.01
+        # Pit falls are catastrophic for this platform, so penalize them more
+        # heavily than generic episode terminations.
+        self.rewards.terrain_fall_penalty = RewTerm(
+            func=mdp.is_terminated_term,
+            weight=-50.0,
+            params={"term_keys": ["terrain_fall"]},
+        )
+        # Keep a dedicated collision penalty term available for stage-wise
+        # tuning without changing the generic termination penalty.
+        self.rewards.base_contact_penalty = RewTerm(
+            func=mdp.is_terminated_term,
+            weight=0.0,
+            params={"term_keys": ["base_contact"]},
+        )
         # Dense reward: distance decrease toward goal (potential-based shaping)
-        from isaaclab.managers import RewardTermCfg as RewTerm
         self.rewards.goal_progress = RewTerm(
             func=mdp.goal_progress,
             weight=10.0,
@@ -104,17 +118,17 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
         )
         self.rewards.pose_goal_proximity = RewTerm(
             func=mdp.pose_goal_proximity,
-            weight=1.0,
+            weight=4.0,
             params={
                 "command_name": "robot_goal",
-                "xy_scale": 1.0,
-                "yaw_scale": math.radians(45.0),
+                "xy_scale": 0.25,
+                "yaw_scale": math.radians(25.0),
                 "activation_xy_threshold": 0.5,
             },
         )
         self.rewards.pose_goal_hold_bonus = RewTerm(
             func=mdp.pose_goal_hold_bonus,
-            weight=2.0,
+            weight=10.0,
             params={
                 "command_name": "robot_goal",
                 "xy_threshold": 0.35,
@@ -123,6 +137,18 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
                 "yaw_rate_threshold": 0.30,
             },
         )
+        # Align success and metrics with the pose objective. The policy should
+        # only count as successful once it is both near the goal and settled
+        # with the correct heading.
+        pose_goal_success_params = {
+            "distance_threshold": 0.35,
+            "yaw_threshold": math.radians(15.0),
+            "lin_speed_threshold": 0.15,
+            "yaw_rate_threshold": 0.30,
+        }
+        self.terminations.time_out.params = dict(pose_goal_success_params)
+        self.terminations.early_termination.params = dict(pose_goal_success_params)
+        self.observations.metrics.in_goal.params = dict(pose_goal_success_params)
 
         # --- Terminations ---
         # Detect navigation collisions from horizontal normal forces on the
@@ -169,6 +195,8 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
                 open_probability=0.95,
                 grid_size=(10, 10),
                 cell_size=3.0,
+                goal_padding_cells=8,
+                spawn_padding_cells=8,
                 add_noise_to_flat=False,
                 add_goal=True,
                 randomize_wall=False,  # no random obstacles, DFS maze only
@@ -180,6 +208,8 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
                 open_probability=0.95,
                 grid_size=(10, 10),
                 cell_size=3.0,
+                goal_padding_cells=8,
+                spawn_padding_cells=8,
                 add_noise_to_flat=False,
                 add_goal=True,
                 randomize_wall=True,
@@ -191,6 +221,8 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
                 open_probability=0.95,
                 grid_size=(10, 10),
                 cell_size=3.0,
+                goal_padding_cells=8,
+                spawn_padding_cells=8,
                 add_noise_to_flat=False,
                 add_goal=True,
                 randomize_wall=False,  # no random walls in pit terrain

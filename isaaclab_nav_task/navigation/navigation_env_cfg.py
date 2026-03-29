@@ -189,6 +189,11 @@ class ObservationsCfg:
             params={"command_name": "robot_goal", "flatten": True},
             noise=DeltaTransformationNoiseCfg(rotation=0.1, translation=0.5, noise_prob=0.1, remove_dist=False),
         )
+        target_heading = ObsTerm(
+            func=mdp.goal_heading_error_trig_delayed,
+            params={"command_name": "robot_goal"},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
         depth_image = ObsTerm(
             func=mdp.depth_image_noisy_delayed, params={"sensor_cfg": SceneEntityCfg("raycast_camera")}
         )
@@ -208,6 +213,7 @@ class ObservationsCfg:
         target_position = ObsTerm(
             func=mdp.generated_commands_reshaped, params={"command_name": "robot_goal", "flatten": True}
         )
+        target_heading = ObsTerm(func=mdp.goal_heading_error_trig, params={"command_name": "robot_goal"})
         time_normalized = ObsTerm(func=mdp.time_normalized, params={"command_name": "robot_goal"})
         height_scan_critic = ObsTerm(
             func=mdp.height_scan_feat, params={"sensor_cfg": SceneEntityCfg("height_scanner_critic")}
@@ -381,8 +387,8 @@ class TerminationsCfg:
     # Terrain fall termination (robot fell off terrain or into deep pit)
     terrain_fall = DoneTerm(
         func=mdp.terrain_fall,
-        time_out=True,
-        params={"fall_height_threshold": -2.0},
+        time_out=False,
+        params={"fall_height_threshold": -0.5},
     )
 
 
