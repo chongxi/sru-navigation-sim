@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import make_dataclass
 
 # Add the parent directory to the path so we can import from the extension
 from isaaclab.app import AppLauncher
@@ -43,6 +44,9 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--episode_length_s", type=float, default=None, help="Override the episode length in seconds.")
+parser.add_argument("--torch_compile_policy", action="store_true", default=False, help="Use torch.compile on supported policy hot paths.")
+parser.add_argument("--torch_compile_mode", type=str, default=None, help="torch.compile mode to use, e.g. default or reduce-overhead.")
 parser.add_argument("--run_name", type=str, default=None, help="Name of the wandb run (appended to log directory).")
 parser.add_argument(
     "--staggered_reset_buckets",
@@ -66,10 +70,171 @@ parser.add_argument("--cell_size", type=float, default=None, help="Maze cell siz
 parser.add_argument("--wall_ratio", type=float, default=None, help="Random wall ratio (0=no walls, 1=max walls).")
 parser.add_argument("--terrain_size", type=float, default=None, help="Terrain tile size in meters (default 30).")
 parser.add_argument("--grid_size", type=int, default=None, help="Maze grid dimension, e.g. 15 for 15x15 (default 15).")
+parser.add_argument(
+    "--terrain_fall_penalty_weight",
+    type=float,
+    default=None,
+    help="Override the terrain_fall_penalty reward weight.",
+)
+parser.add_argument(
+    "--base_contact_penalty_weight",
+    type=float,
+    default=None,
+    help="Override the base_contact_penalty reward weight.",
+)
+parser.add_argument(
+    "--goal_progress_weight",
+    type=float,
+    default=None,
+    help="Override the goal_progress reward weight.",
+)
+parser.add_argument(
+    "--reach_goal_xy_soft_weight",
+    type=float,
+    default=None,
+    help="Override the reach_goal_xy_soft reward weight.",
+)
+parser.add_argument(
+    "--reach_goal_xy_tight_weight",
+    type=float,
+    default=None,
+    help="Override the reach_goal_xy_tight reward weight.",
+)
+parser.add_argument(
+    "--pose_goal_hold_bonus_weight",
+    type=float,
+    default=None,
+    help="Override the pose_goal_hold_bonus reward weight.",
+)
+parser.add_argument(
+    "--pose_goal_proximity_weight",
+    type=float,
+    default=None,
+    help="Override the pose_goal_proximity reward weight.",
+)
+parser.add_argument(
+    "--in_goal_bonus_weight",
+    type=float,
+    default=None,
+    help="Override the in_goal terminal bonus reward weight.",
+)
+parser.add_argument(
+    "--trapped_penalty_weight",
+    type=float,
+    default=None,
+    help="Override the trapped termination penalty weight.",
+)
+parser.add_argument(
+    "--large_pitch_angle_penalty_weight",
+    type=float,
+    default=None,
+    help="Override the large_pitch_angle termination penalty weight.",
+)
+parser.add_argument(
+    "--goal_progress_weight_end",
+    type=float,
+    default=None,
+    help="Linearly decay goal_progress to this final weight over training.",
+)
+parser.add_argument(
+    "--reach_goal_xy_soft_weight_end",
+    type=float,
+    default=None,
+    help="Linearly change reach_goal_xy_soft to this final weight over training.",
+)
+parser.add_argument(
+    "--reach_goal_xy_tight_weight_end",
+    type=float,
+    default=None,
+    help="Linearly change reach_goal_xy_tight to this final weight over training.",
+)
+parser.add_argument(
+    "--pose_goal_hold_bonus_weight_end",
+    type=float,
+    default=None,
+    help="Linearly change pose_goal_hold_bonus to this final weight over training.",
+)
+parser.add_argument(
+    "--pose_goal_proximity_weight_end",
+    type=float,
+    default=None,
+    help="Linearly change pose_goal_proximity to this final weight over training.",
+)
+parser.add_argument(
+    "--terrain_fall_penalty_weight_end",
+    type=float,
+    default=None,
+    help="Linearly increase terrain_fall_penalty to this final weight over training.",
+)
+parser.add_argument(
+    "--base_contact_penalty_weight_end",
+    type=float,
+    default=None,
+    help="Linearly increase base_contact_penalty to this final weight over training.",
+)
+parser.add_argument(
+    "--trapped_penalty_weight_end",
+    type=float,
+    default=None,
+    help="Linearly increase trapped_penalty to this final weight over training.",
+)
+parser.add_argument(
+    "--large_pitch_angle_penalty_weight_end",
+    type=float,
+    default=None,
+    help="Linearly increase large_pitch_angle_penalty to this final weight over training.",
+)
+parser.add_argument(
+    "--reward_schedule_start_frac",
+    type=float,
+    default=None,
+    help="Fraction of total training env-steps where reward scheduling starts.",
+)
+parser.add_argument(
+    "--reward_schedule_end_frac",
+    type=float,
+    default=None,
+    help="Fraction of total training env-steps where reward scheduling ends.",
+)
 
 # Append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+
+
+def _apply_task_default_overrides(args: argparse.Namespace):
+    """Apply task-specific defaults when the user did not pass explicit overrides."""
+    if args.task != "Isaac-Nav-MDPO-DiffDrive-v0":
+        return
+
+    default_overrides = {
+        "num_envs": 4096,
+        "max_iterations": 3000,
+        "episode_length_s": 100.0,
+        "difficulty": [0.5, 1.0],
+        "goal_progress_weight": 15.0,
+        "goal_progress_weight_end": 0.0,
+        "reach_goal_xy_soft_weight_end": 0.0,
+        "reach_goal_xy_tight_weight_end": 0.75,
+        "in_goal_bonus_weight": 1800.0,
+        "terrain_fall_penalty_weight": -250.0,
+        "terrain_fall_penalty_weight_end": -1500.0,
+        "base_contact_penalty_weight": 0.0,
+        "base_contact_penalty_weight_end": -1200.0,
+        "trapped_penalty_weight": 0.0,
+        "trapped_penalty_weight_end": -3000.0,
+        "large_pitch_angle_penalty_weight": -50.0,
+        "large_pitch_angle_penalty_weight_end": -300.0,
+        "reward_schedule_start_frac": 0.0,
+        "reward_schedule_end_frac": 0.2,
+    }
+
+    for name, value in default_overrides.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+
+
+_apply_task_default_overrides(args_cli)
 
 # always enable cameras to record video
 if args_cli.video:
@@ -92,10 +257,12 @@ import isaaclab_tasks  # noqa: F401
 import isaaclab_nav_task  # noqa: F401
 
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
+import isaaclab_nav_task.navigation.mdp as nav_mdp
 from isaaclab_nav_task.vecenv_wrapper import SruRslRlVecEnvWrapper
 
 # Set torch backends for better performance
@@ -103,6 +270,37 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def _attach_linear_reward_schedule(
+    env_cfg: ManagerBasedRLEnvCfg,
+    *,
+    attr_name: str,
+    term_name: str,
+    start_weight: float,
+    end_weight: float,
+    start_step: int,
+    end_step: int,
+):
+    """Attach a linear reward-weight curriculum term to the env config."""
+    if env_cfg.curriculum is None:
+        RuntimeCurriculumCfg = make_dataclass("RuntimeCurriculumCfg", [])
+        env_cfg.curriculum = RuntimeCurriculumCfg()
+
+    setattr(
+        env_cfg.curriculum,
+        attr_name,
+        CurrTerm(
+            func=nav_mdp.linearly_interpolate_reward_weight,
+            params={
+                "term_name": term_name,
+                "start_weight": float(start_weight),
+                "end_weight": float(end_weight),
+                "start_step": int(start_step),
+                "end_step": int(end_step),
+            },
+        ),
+    )
 
 
 def main():
@@ -118,8 +316,143 @@ def main():
         agent_cfg.seed = args_cli.seed
     if args_cli.max_iterations is not None:
         agent_cfg.max_iterations = args_cli.max_iterations
+    if args_cli.episode_length_s is not None:
+        env_cfg.episode_length_s = args_cli.episode_length_s
+    if args_cli.torch_compile_policy:
+        agent_cfg.torch_compile_policy = True
+    if args_cli.torch_compile_mode is not None:
+        agent_cfg.torch_compile_mode = args_cli.torch_compile_mode
     if args_cli.run_name is not None:
         agent_cfg.run_name = args_cli.run_name
+
+    # Override reward config from command line
+    if args_cli.terrain_fall_penalty_weight is not None and hasattr(env_cfg.rewards, "terrain_fall_penalty"):
+        env_cfg.rewards.terrain_fall_penalty.weight = args_cli.terrain_fall_penalty_weight
+    if args_cli.base_contact_penalty_weight is not None and hasattr(env_cfg.rewards, "base_contact_penalty"):
+        env_cfg.rewards.base_contact_penalty.weight = args_cli.base_contact_penalty_weight
+    if args_cli.goal_progress_weight is not None and hasattr(env_cfg.rewards, "goal_progress"):
+        env_cfg.rewards.goal_progress.weight = args_cli.goal_progress_weight
+    if args_cli.reach_goal_xy_soft_weight is not None and hasattr(env_cfg.rewards, "reach_goal_xy_soft"):
+        env_cfg.rewards.reach_goal_xy_soft.weight = args_cli.reach_goal_xy_soft_weight
+    if args_cli.reach_goal_xy_tight_weight is not None and hasattr(env_cfg.rewards, "reach_goal_xy_tight"):
+        env_cfg.rewards.reach_goal_xy_tight.weight = args_cli.reach_goal_xy_tight_weight
+    if args_cli.pose_goal_hold_bonus_weight is not None and hasattr(env_cfg.rewards, "pose_goal_hold_bonus"):
+        env_cfg.rewards.pose_goal_hold_bonus.weight = args_cli.pose_goal_hold_bonus_weight
+    if args_cli.pose_goal_proximity_weight is not None and hasattr(env_cfg.rewards, "pose_goal_proximity"):
+        env_cfg.rewards.pose_goal_proximity.weight = args_cli.pose_goal_proximity_weight
+    if args_cli.in_goal_bonus_weight is not None and getattr(env_cfg.rewards, "in_goal_bonus", None) is not None:
+        env_cfg.rewards.in_goal_bonus.weight = args_cli.in_goal_bonus_weight
+    if args_cli.trapped_penalty_weight is not None and getattr(env_cfg.rewards, "trapped_penalty", None) is not None:
+        env_cfg.rewards.trapped_penalty.weight = args_cli.trapped_penalty_weight
+    if (
+        args_cli.large_pitch_angle_penalty_weight is not None
+        and getattr(env_cfg.rewards, "large_pitch_angle_penalty", None) is not None
+    ):
+        env_cfg.rewards.large_pitch_angle_penalty.weight = args_cli.large_pitch_angle_penalty_weight
+
+    reward_schedule_start_frac = 0.0 if args_cli.reward_schedule_start_frac is None else args_cli.reward_schedule_start_frac
+    reward_schedule_end_frac = 1.0 if args_cli.reward_schedule_end_frac is None else args_cli.reward_schedule_end_frac
+
+    max_iterations_for_schedule = (
+        args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
+    )
+    total_train_steps = int(agent_cfg.num_steps_per_env * max_iterations_for_schedule)
+    schedule_start_step = int(total_train_steps * reward_schedule_start_frac)
+    schedule_end_step = int(total_train_steps * reward_schedule_end_frac)
+
+    if args_cli.goal_progress_weight_end is not None and hasattr(env_cfg.rewards, "goal_progress"):
+        _attach_linear_reward_schedule(
+            env_cfg,
+            attr_name="goal_progress_weight_schedule",
+            term_name="goal_progress",
+            start_weight=env_cfg.rewards.goal_progress.weight,
+            end_weight=args_cli.goal_progress_weight_end,
+            start_step=schedule_start_step,
+            end_step=schedule_end_step,
+        )
+    if args_cli.reach_goal_xy_soft_weight_end is not None and hasattr(env_cfg.rewards, "reach_goal_xy_soft"):
+        _attach_linear_reward_schedule(
+            env_cfg,
+            attr_name="reach_goal_xy_soft_weight_schedule",
+            term_name="reach_goal_xy_soft",
+            start_weight=env_cfg.rewards.reach_goal_xy_soft.weight,
+            end_weight=args_cli.reach_goal_xy_soft_weight_end,
+            start_step=schedule_start_step,
+            end_step=schedule_end_step,
+        )
+    if args_cli.reach_goal_xy_tight_weight_end is not None and hasattr(env_cfg.rewards, "reach_goal_xy_tight"):
+        _attach_linear_reward_schedule(
+            env_cfg,
+            attr_name="reach_goal_xy_tight_weight_schedule",
+            term_name="reach_goal_xy_tight",
+            start_weight=env_cfg.rewards.reach_goal_xy_tight.weight,
+            end_weight=args_cli.reach_goal_xy_tight_weight_end,
+            start_step=schedule_start_step,
+            end_step=schedule_end_step,
+        )
+    if args_cli.pose_goal_hold_bonus_weight_end is not None and hasattr(env_cfg.rewards, "pose_goal_hold_bonus"):
+        _attach_linear_reward_schedule(
+            env_cfg,
+            attr_name="pose_goal_hold_bonus_weight_schedule",
+            term_name="pose_goal_hold_bonus",
+            start_weight=env_cfg.rewards.pose_goal_hold_bonus.weight,
+            end_weight=args_cli.pose_goal_hold_bonus_weight_end,
+            start_step=schedule_start_step,
+            end_step=schedule_end_step,
+        )
+    if args_cli.pose_goal_proximity_weight_end is not None and hasattr(env_cfg.rewards, "pose_goal_proximity"):
+        _attach_linear_reward_schedule(
+            env_cfg,
+            attr_name="pose_goal_proximity_weight_schedule",
+            term_name="pose_goal_proximity",
+            start_weight=env_cfg.rewards.pose_goal_proximity.weight,
+            end_weight=args_cli.pose_goal_proximity_weight_end,
+            start_step=schedule_start_step,
+            end_step=schedule_end_step,
+        )
+    if args_cli.terrain_fall_penalty_weight_end is not None and hasattr(env_cfg.rewards, "terrain_fall_penalty"):
+        _attach_linear_reward_schedule(
+            env_cfg,
+            attr_name="terrain_fall_penalty_weight_schedule",
+            term_name="terrain_fall_penalty",
+            start_weight=env_cfg.rewards.terrain_fall_penalty.weight,
+            end_weight=args_cli.terrain_fall_penalty_weight_end,
+            start_step=schedule_start_step,
+            end_step=schedule_end_step,
+        )
+    if args_cli.base_contact_penalty_weight_end is not None and hasattr(env_cfg.rewards, "base_contact_penalty"):
+        _attach_linear_reward_schedule(
+            env_cfg,
+            attr_name="base_contact_penalty_weight_schedule",
+            term_name="base_contact_penalty",
+            start_weight=env_cfg.rewards.base_contact_penalty.weight,
+            end_weight=args_cli.base_contact_penalty_weight_end,
+            start_step=schedule_start_step,
+            end_step=schedule_end_step,
+        )
+    if args_cli.trapped_penalty_weight_end is not None and hasattr(env_cfg.rewards, "trapped_penalty"):
+        _attach_linear_reward_schedule(
+            env_cfg,
+            attr_name="trapped_penalty_weight_schedule",
+            term_name="trapped_penalty",
+            start_weight=env_cfg.rewards.trapped_penalty.weight,
+            end_weight=args_cli.trapped_penalty_weight_end,
+            start_step=schedule_start_step,
+            end_step=schedule_end_step,
+        )
+    if (
+        args_cli.large_pitch_angle_penalty_weight_end is not None
+        and hasattr(env_cfg.rewards, "large_pitch_angle_penalty")
+    ):
+        _attach_linear_reward_schedule(
+            env_cfg,
+            attr_name="large_pitch_angle_penalty_weight_schedule",
+            term_name="large_pitch_angle_penalty",
+            start_weight=env_cfg.rewards.large_pitch_angle_penalty.weight,
+            end_weight=args_cli.large_pitch_angle_penalty_weight_end,
+            start_step=schedule_start_step,
+            end_step=schedule_end_step,
+        )
 
     # Override terrain config from command line
     tg = env_cfg.scene.terrain.terrain_generator

@@ -11,6 +11,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 
 from isaaclab_nav_task.navigation.navigation_env_cfg import NavigationEnvCfg
 import isaaclab_nav_task.navigation.mdp as mdp
@@ -54,7 +55,7 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
                 scale=1.0,
                 use_default_offset=False,
             ),
-            policy_scaling=[2.5, 0.0, 2.0],  # [vx m/s, vy(ignored), yaw-target slew rate rad/s]
+            policy_scaling=[2.5, 0.0, 3.0],  # [vx m/s, vy(ignored), yaw-target slew rate rad/s]
             use_raw_actions=True,
             policy_distr_type="gaussian",
         )
@@ -98,6 +99,7 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
         self.rewards.action_rate_l1.weight = -0.01
         # Pit falls are catastrophic for this platform, so penalize them more
         # heavily than generic episode terminations.
+        self.rewards.episode_termination = None
         self.rewards.terrain_fall_penalty = RewTerm(
             func=mdp.is_terminated_term,
             weight=-50.0,
@@ -107,8 +109,23 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
         # tuning without changing the generic termination penalty.
         self.rewards.base_contact_penalty = RewTerm(
             func=mdp.is_terminated_term,
-            weight=0.0,
+            weight=-50.0,
             params={"term_keys": ["base_contact"]},
+        )
+        self.rewards.large_pitch_angle_penalty = RewTerm(
+            func=mdp.is_terminated_term,
+            weight=-50.0,
+            params={"term_keys": ["large_pitch_angle"]},
+        )
+        self.rewards.trapped_penalty = RewTerm(
+            func=mdp.is_terminated_term,
+            weight=-100.0,
+            params={"term_keys": ["trapped"]},
+        )
+        self.rewards.in_goal_bonus = RewTerm(
+            func=mdp.is_terminated_term,
+            weight=500.0,
+            params={"term_keys": ["in_goal"]},
         )
         # Dense reward: distance decrease toward goal (potential-based shaping)
         self.rewards.goal_progress = RewTerm(
@@ -146,8 +163,43 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
             "lin_speed_threshold": 0.15,
             "yaw_rate_threshold": 0.30,
         }
+        pose_goal_near_params = {
+            "distance_threshold": 0.60,
+            "yaw_threshold": math.radians(30.0),
+            "lin_speed_threshold": 0.25,
+            "yaw_rate_threshold": 0.50,
+        }
         self.terminations.time_out.params = dict(pose_goal_success_params)
-        self.terminations.early_termination.params = dict(pose_goal_success_params)
+        self.terminations.in_goal = self.terminations.early_termination
+        self.terminations.in_goal.func = mdp.in_goal_navigation
+        self.terminations.in_goal.time_out = False
+        self.terminations.in_goal.params = dict(pose_goal_success_params)
+        self.terminations.early_termination = None
+        self.terminations.near_goal = DoneTerm(
+            func=mdp.near_goal_navigation,
+            time_out=False,
+            params={
+                **pose_goal_near_params,
+                "in_goal_distance_threshold": pose_goal_success_params["distance_threshold"],
+                "in_goal_yaw_threshold": pose_goal_success_params["yaw_threshold"],
+                "in_goal_lin_speed_threshold": pose_goal_success_params["lin_speed_threshold"],
+                "in_goal_yaw_rate_threshold": pose_goal_success_params["yaw_rate_threshold"],
+                "hold_time_s": 8.0,
+            },
+        )
+        self.terminations.trapped = DoneTerm(
+            func=mdp.trapped_navigation,
+            time_out=False,
+            params={
+                "near_goal_distance_threshold": pose_goal_near_params["distance_threshold"],
+                "near_goal_yaw_threshold": pose_goal_near_params["yaw_threshold"],
+                "near_goal_lin_speed_threshold": pose_goal_near_params["lin_speed_threshold"],
+                "near_goal_yaw_rate_threshold": pose_goal_near_params["yaw_rate_threshold"],
+                "window_s": 30.0,
+                "single_cell_time_s": 10.0,
+                "top_two_cell_time_s": 15.0,
+            },
+        )
         self.observations.metrics.in_goal.params = dict(pose_goal_success_params)
 
         # --- Terminations ---
@@ -183,50 +235,46 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
         self.events.randomize_low_pass_filter_alpha = None
 
         # --- Terrain ---
-        # Diff-drive: wider corridors (cell_size=3.0 vs B2W's 2.0) because
-        # xlerobot is wider (~0.7m) than B2W (~0.4m). More open walls and
-        # fewer random obstacles for easier initial learning.
+        # Match the B2W terrain distribution more closely so task difficulty is
+        # comparable across robots, but keep all stair-generating features off
+        # because the diff-drive platform cannot traverse them.
         self.scene.terrain.max_init_terrain_level = 10
-        self.scene.terrain.terrain_generator.difficulty_range = [0.2, 0.7]
+        self.scene.terrain.terrain_generator.difficulty_range = [0.5, 1.0]
         self.scene.terrain.terrain_generator.curriculum = False
         self.scene.terrain.terrain_generator.sub_terrains = {
             "maze": HfMazeTerrainCfg(
-                proportion=0.4,
-                open_probability=0.95,
-                grid_size=(10, 10),
-                cell_size=3.0,
-                goal_padding_cells=8,
-                spawn_padding_cells=8,
-                add_noise_to_flat=False,
-                add_goal=True,
-                randomize_wall=False,  # no random obstacles, DFS maze only
-                random_wall_ratio=0.0,
-                add_stairs_to_maze=False,
-            ),
-            "non_maze": HfMazeTerrainCfg(
-                proportion=0.3,
-                open_probability=0.95,
-                grid_size=(10, 10),
-                cell_size=3.0,
-                goal_padding_cells=8,
-                spawn_padding_cells=8,
+                # B2W uses 0.3 maze + 0.3 stairs. Since stairs are disabled for
+                # diff-drive, fold that share back into a plain maze terrain.
+                proportion=0.6,
+                open_probability=0.9,
+                grid_size=(15, 15),
+                cell_size=2.0,
                 add_noise_to_flat=False,
                 add_goal=True,
                 randomize_wall=True,
-                random_wall_ratio=0.2,  # sparse obstacles, less chance of blocking
+                random_wall_ratio=0.5,
+                add_stairs_to_maze=False,
+            ),
+            "non_maze": HfMazeTerrainCfg(
+                proportion=0.2,
+                open_probability=0.9,
+                grid_size=(15, 15),
+                cell_size=2.0,
+                add_noise_to_flat=False,
+                add_goal=True,
+                randomize_wall=True,
+                random_wall_ratio=1.0,
                 non_maze_terrain=True,
             ),
             "pits": HfMazeTerrainCfg(
-                proportion=0.3,
-                open_probability=0.95,
-                grid_size=(10, 10),
-                cell_size=3.0,
-                goal_padding_cells=8,
-                spawn_padding_cells=8,
+                proportion=0.2,
+                open_probability=0.9,
+                grid_size=(15, 15),
+                cell_size=2.0,
                 add_noise_to_flat=False,
                 add_goal=True,
-                randomize_wall=False,  # no random walls in pit terrain
-                random_wall_ratio=0.0,
+                randomize_wall=True,
+                random_wall_ratio=1.0,
                 non_maze_terrain=True,
                 dynamic_obstacles=True,
             ),

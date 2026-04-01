@@ -88,6 +88,9 @@ class RslRlPpoAlgorithmCfg:
     learning_rate: float = MISSING
     """The learning rate for the policy."""
 
+    min_learning_rate: float = 1.0e-7
+    """The minimum learning rate for schedules that decay to a floor."""
+
     schedule: str = MISSING
     """The learning rate schedule."""
 
@@ -122,6 +125,12 @@ class RslRlOnPolicyRunnerCfg:
 
     empirical_normalization: bool = MISSING
     """Whether to use empirical normalization."""
+
+    torch_compile_policy: bool = False
+    """Whether to use torch.compile on supported policy hot paths."""
+
+    torch_compile_mode: str = "default"
+    """Torch compile mode for supported policy hot paths."""
 
     policy: RslRlPpoActorCriticCfg = MISSING
     """The policy configuration."""

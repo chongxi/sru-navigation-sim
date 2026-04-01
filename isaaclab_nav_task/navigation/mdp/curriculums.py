@@ -54,3 +54,55 @@ def disable_backward_penalty_after_steps(
                 pass
     
     return torch.tensor(float(env.common_step_counter))
+
+
+def linearly_interpolate_reward_weight(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    start_weight: float,
+    end_weight: float,
+    start_step: int,
+    end_step: int,
+) -> torch.Tensor:
+    """Linearly interpolate a reward weight over training steps.
+
+    The curriculum state returned is the currently applied weight, which Isaac Lab
+    logs through the curriculum manager when environments reset.
+
+    Args:
+        env: The learning environment.
+        env_ids: Not used directly; the weight change applies globally.
+        term_name: Reward term name in the reward manager.
+        start_weight: Weight before the schedule starts.
+        end_weight: Weight after the schedule finishes.
+        start_step: Global environment step where interpolation begins.
+        end_step: Global environment step where interpolation ends.
+
+    Returns:
+        Current applied reward weight for logging.
+    """
+    del env_ids
+
+    if end_step <= start_step:
+        current_weight = float(end_weight)
+    else:
+        step = int(env.common_step_counter)
+        if step <= start_step:
+            alpha = 0.0
+        elif step >= end_step:
+            alpha = 1.0
+        else:
+            alpha = (step - start_step) / float(end_step - start_step)
+        current_weight = float(start_weight + alpha * (end_weight - start_weight))
+
+    if hasattr(env.reward_manager, "get_term_cfg"):
+        try:
+            term_cfg = env.reward_manager.get_term_cfg(term_name)
+            if term_cfg.weight != current_weight:
+                term_cfg.weight = current_weight
+                env.reward_manager.set_term_cfg(term_name, term_cfg)
+        except ValueError:
+            pass
+
+    return torch.tensor(current_weight, device=env.device)

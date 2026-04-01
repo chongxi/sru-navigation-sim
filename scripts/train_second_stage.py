@@ -33,6 +33,7 @@ parser.add_argument("--video_interval", type=int, default=2000, help="Interval b
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, required=True, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
+parser.add_argument("--episode_length_s", type=float, default=None, help="Override the episode length in seconds.")
 parser.add_argument(
     "--max_iterations",
     type=int,
@@ -40,6 +41,18 @@ parser.add_argument(
     help="Additional training iterations to run after loading the checkpoint.",
 )
 parser.add_argument("--run_name", type=str, default=None, help="Name appended to the log directory.")
+parser.add_argument(
+    "--torch_compile_policy",
+    action="store_true",
+    default=False,
+    help="Use torch.compile on supported policy hot paths.",
+)
+parser.add_argument(
+    "--torch_compile_mode",
+    type=str,
+    default=None,
+    help="torch.compile mode to use, e.g. default or reduce-overhead.",
+)
 parser.add_argument(
     "--staggered_reset_buckets",
     type=int,
@@ -57,6 +70,25 @@ parser.add_argument(
         "Override the algorithm learning rate. When set, the resumed optimizer LR is replaced after checkpoint load "
         "and the second-stage learning-rate schedule restarts from iteration 0."
     ),
+)
+parser.add_argument(
+    "--num_steps_per_env",
+    type=int,
+    default=None,
+    help="Override rollout length (num_steps_per_env) for second-stage training.",
+)
+parser.add_argument(
+    "--entropy_coef",
+    type=float,
+    default=None,
+    help="Override the algorithm entropy coefficient for second-stage training.",
+)
+parser.add_argument(
+    "--schedule",
+    type=str,
+    default=None,
+    choices=["fixed", "linear", "cosine", "exponential", "adaptive"],
+    help="Override the learning-rate schedule for second-stage training.",
 )
 parser.add_argument(
     "--load_optimizer",
@@ -109,6 +141,18 @@ parser.add_argument(
 )
 parser.add_argument(
     "--reach_goal_xy_tight_weight", type=float, default=None, help="Override reach_goal_xy_tight weight."
+)
+parser.add_argument(
+    "--in_goal_bonus_weight", type=float, default=None, help="Override the in_goal terminal bonus weight."
+)
+parser.add_argument(
+    "--trapped_penalty_weight", type=float, default=None, help="Override the trapped termination penalty weight."
+)
+parser.add_argument(
+    "--large_pitch_angle_penalty_weight",
+    type=float,
+    default=None,
+    help="Override the large_pitch_angle termination penalty weight.",
 )
 parser.add_argument(
     "--episode_termination_weight",
@@ -264,7 +308,16 @@ def _apply_second_stage_overrides(env_cfg) -> None:
         env_cfg.rewards.reach_goal_xy_soft.weight = args_cli.reach_goal_xy_soft_weight
     if args_cli.reach_goal_xy_tight_weight is not None and hasattr(env_cfg.rewards, "reach_goal_xy_tight"):
         env_cfg.rewards.reach_goal_xy_tight.weight = args_cli.reach_goal_xy_tight_weight
-    if args_cli.episode_termination_weight is not None and hasattr(env_cfg.rewards, "episode_termination"):
+    if args_cli.in_goal_bonus_weight is not None and getattr(env_cfg.rewards, "in_goal_bonus", None) is not None:
+        env_cfg.rewards.in_goal_bonus.weight = args_cli.in_goal_bonus_weight
+    if args_cli.trapped_penalty_weight is not None and getattr(env_cfg.rewards, "trapped_penalty", None) is not None:
+        env_cfg.rewards.trapped_penalty.weight = args_cli.trapped_penalty_weight
+    if (
+        args_cli.large_pitch_angle_penalty_weight is not None
+        and getattr(env_cfg.rewards, "large_pitch_angle_penalty", None) is not None
+    ):
+        env_cfg.rewards.large_pitch_angle_penalty.weight = args_cli.large_pitch_angle_penalty_weight
+    if args_cli.episode_termination_weight is not None and getattr(env_cfg.rewards, "episode_termination", None) is not None:
         env_cfg.rewards.episode_termination.weight = args_cli.episode_termination_weight
     if args_cli.terrain_fall_penalty_weight is not None and hasattr(env_cfg.rewards, "terrain_fall_penalty"):
         env_cfg.rewards.terrain_fall_penalty.weight = args_cli.terrain_fall_penalty_weight
@@ -275,8 +328,18 @@ def _apply_second_stage_overrides(env_cfg) -> None:
 
 
 def _apply_agent_overrides(agent_cfg) -> None:
+    if args_cli.num_steps_per_env is not None:
+        agent_cfg.num_steps_per_env = args_cli.num_steps_per_env
     if args_cli.learning_rate is not None:
         agent_cfg.algorithm.learning_rate = args_cli.learning_rate
+    if args_cli.entropy_coef is not None:
+        agent_cfg.algorithm.entropy_coef = args_cli.entropy_coef
+    if args_cli.schedule is not None:
+        agent_cfg.algorithm.schedule = args_cli.schedule
+    if args_cli.torch_compile_policy:
+        agent_cfg.torch_compile_policy = True
+    if args_cli.torch_compile_mode is not None:
+        agent_cfg.torch_compile_mode = args_cli.torch_compile_mode
 
 
 def _override_loaded_learning_rate(runner, learning_rate: float) -> None:
@@ -307,6 +370,8 @@ def main():
         agent_cfg.seed = args_cli.seed
     if args_cli.max_iterations is not None:
         agent_cfg.max_iterations = args_cli.max_iterations
+    if args_cli.episode_length_s is not None:
+        env_cfg.episode_length_s = args_cli.episode_length_s
     if args_cli.run_name is not None:
         agent_cfg.run_name = args_cli.run_name
 

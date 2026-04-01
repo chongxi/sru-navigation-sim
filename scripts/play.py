@@ -22,6 +22,11 @@ Examples:
     python scripts/play.py --task Isaac-Navigation-B2W-Play-v0 --checkpoint path/to/model.pt
     python scripts/play.py --task Isaac-Navigation-B2W-Play-v0 --video --num_envs 16
 
+    python scripts/play.py \
+  --task Isaac-Nav-MDPO-DiffDrive-Play-v0 \
+  --checkpoint path/to/model.pt \
+  --num_envs 1
+
 Note: Automatically finds latest checkpoint if --checkpoint not specified.
 """
 
@@ -63,6 +68,14 @@ parser.add_argument("--cell_size", type=float, default=None, help="Maze cell siz
 parser.add_argument("--wall_ratio", type=float, default=None, help="Random wall ratio (0=no walls, 1=max walls).")
 parser.add_argument("--terrain_size", type=float, default=None, help="Terrain tile size in meters (default 30).")
 parser.add_argument("--grid_size", type=int, default=None, help="Maze grid dimension, e.g. 15 for 15x15.")
+parser.add_argument("--episode_length", type=float, default=None, help="Episode length in seconds (overrides config).")
+parser.add_argument(
+    "--policy_scale_yaw",
+    type=float,
+    default=None,
+    help="Override the third entry of actions.velocity_command.policy_scaling (yaw/heading scale).",
+)
+parser.add_argument("--debug_raycast", action="store_true", default=False, help="Enable raycast camera debug visualization.")
 
 # Append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -245,6 +258,23 @@ def main():
     # Override config from command line
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs
+    if args_cli.episode_length is not None:
+        env_cfg.episode_length_s = args_cli.episode_length
+    if args_cli.policy_scale_yaw is not None:
+        action_cfg = getattr(env_cfg.actions, "velocity_command", None)
+        if action_cfg is None or not hasattr(action_cfg, "policy_scaling"):
+            raise AttributeError("This task does not expose actions.velocity_command.policy_scaling")
+        policy_scaling = list(action_cfg.policy_scaling)
+        if len(policy_scaling) < 3:
+            raise ValueError(
+                f"actions.velocity_command.policy_scaling must have at least 3 entries, got {policy_scaling}"
+            )
+        old_yaw_scale = policy_scaling[2]
+        policy_scaling[2] = args_cli.policy_scale_yaw
+        action_cfg.policy_scaling = policy_scaling
+        print(f"[INFO] Overriding yaw policy scale from {old_yaw_scale} to {args_cli.policy_scale_yaw}")
+    if args_cli.debug_raycast and hasattr(env_cfg.scene, "raycast_camera") and env_cfg.scene.raycast_camera is not None:
+        env_cfg.scene.raycast_camera.debug_vis = True
 
     # Override terrain config from command line
     tg = env_cfg.scene.terrain.terrain_generator
@@ -261,29 +291,46 @@ def main():
         if args_cli.terrain_type is not None:
             from isaaclab_nav_task.terrains.hf_terrains_maze_cfg import HfMazeTerrainCfg
 
-            base = next(iter(tg.sub_terrains.values()))
-            cs = args_cli.cell_size or getattr(base, "cell_size", 2.0)
-            wr = args_cli.wall_ratio if args_cli.wall_ratio is not None else getattr(base, "random_wall_ratio", 0.5)
-            _gs = gs or getattr(base, "grid_size", (15, 15))
+            default_base = next(iter(tg.sub_terrains.values()))
+
+            def _subterrain_or_default(name: str):
+                return tg.sub_terrains.get(name, default_base)
+
             if args_cli.terrain_type == "maze":
+                base = _subterrain_or_default("maze")
+                cs = args_cli.cell_size or getattr(base, "cell_size", 2.0)
+                wr = (
+                    args_cli.wall_ratio
+                    if args_cli.wall_ratio is not None
+                    else getattr(base, "random_wall_ratio", 0.5)
+                )
+                _gs = gs or getattr(base, "grid_size", (15, 15))
                 tg.sub_terrains = {
                     "maze": HfMazeTerrainCfg(
                         proportion=1.0,
-                        open_probability=0.9,
+                        open_probability=getattr(base, "open_probability", 0.9),
                         grid_size=_gs,
                         cell_size=cs,
                         add_noise_to_flat=False,
                         add_goal=True,
                         randomize_wall=True,
                         random_wall_ratio=wr,
-                        add_stairs_to_maze=False,
+                        add_stairs_to_maze=getattr(base, "add_stairs_to_maze", False),
                     ),
                 }
             elif args_cli.terrain_type == "non_maze":
+                base = _subterrain_or_default("non_maze")
+                cs = args_cli.cell_size or getattr(base, "cell_size", 2.0)
+                wr = (
+                    args_cli.wall_ratio
+                    if args_cli.wall_ratio is not None
+                    else getattr(base, "random_wall_ratio", 0.5)
+                )
+                _gs = gs or getattr(base, "grid_size", (15, 15))
                 tg.sub_terrains = {
                     "non_maze": HfMazeTerrainCfg(
                         proportion=1.0,
-                        open_probability=0.9,
+                        open_probability=getattr(base, "open_probability", 0.9),
                         grid_size=_gs,
                         cell_size=cs,
                         add_noise_to_flat=False,
@@ -295,6 +342,9 @@ def main():
                     ),
                 }
             elif args_cli.terrain_type == "flat":
+                base = _subterrain_or_default("non_maze")
+                cs = args_cli.cell_size or getattr(base, "cell_size", 2.0)
+                _gs = gs or getattr(base, "grid_size", (15, 15))
                 tg.sub_terrains = {
                     "flat": HfMazeTerrainCfg(
                         proportion=1.0,

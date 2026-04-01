@@ -46,7 +46,7 @@ class DiffDriveNavigationSE2ActionCfg(ActionTermCfg):
     offset: list[float] = [0.0, 0.0, 0.0]
     """Offset for the raw actions [vx, vy, heading]."""
 
-    policy_scaling: list[float] = [2.5, 0.0, 2.0]
+    policy_scaling: list[float] = [2.5, 0.0, 3.0]
     """Policy-dependent scaling: [vx in m/s, vy ignored, yaw-target-rate in rad/s]."""
 
     use_raw_actions: bool = True

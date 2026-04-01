@@ -380,6 +380,7 @@ class RobotNavigationGoalCommand(CommandTerm):
         self.steps_at_goal = torch.zeros(self.num_envs, device=self.device)
         self.time_at_goal = torch.zeros(self.num_envs, device=self.device)
         self.required_steps_at_goal = 4.0 / self.env.step_dt
+        self.near_goal_accumulated_steps = torch.zeros(self.num_envs, device=self.device)
 
         self.initial_distance_to_goal = torch.zeros(self.num_envs, device=self.device)
         self.distance_to_goal = torch.zeros(self.num_envs, device=self.device)
@@ -588,8 +589,14 @@ class RobotNavigationGoalCommand(CommandTerm):
         """Reset tracking state for specified environments."""
         self.steps_at_goal[env_ids] = 0
         self.time_at_goal[env_ids] = 0
+        self.near_goal_accumulated_steps[env_ids] = 0
         self.total_distance_traveled[env_ids] = 0.0
         self.previous_position[env_ids] = self.robot.data.root_pos_w[env_ids].clone()
+        if hasattr(self, "trap_cell_history"):
+            self.trap_cell_history[env_ids] = -1
+            self.trap_cell_counts[env_ids] = 0
+            self.trap_cell_history_head[env_ids] = 0
+            self.trap_cell_history_len[env_ids] = 0
 
     def _update_command(self):
         """Update command in body frame."""
