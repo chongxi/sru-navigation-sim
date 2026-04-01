@@ -141,6 +141,24 @@ parser.add_argument(
 )
 parser.add_argument("--depth_min", type=float, default=0.3, help="Minimum displayed depth in meters.")
 parser.add_argument("--depth_max", type=float, default=8.0, help="Maximum displayed depth in meters.")
+parser.add_argument(
+    "--brick_walls",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Apply the brick material to raised wall faces on the generated txt-maze terrain mesh.",
+)
+parser.add_argument(
+    "--brick_usd",
+    type=str,
+    default="maze/brick/wall_1.usd",
+    help="Brick material source. Accepts the packaged USD or a direct MDL file path.",
+)
+parser.add_argument(
+    "--brick_texture_scale",
+    type=float,
+    default=0.5,
+    help="Projected brick texture scale applied to the wall material.",
+)
 
 parser.add_argument(
     "--debug_lifecycle",
@@ -171,6 +189,7 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import numpy as np
 import torch
+from pxr import Sdf, Usd, UsdGeom, UsdShade
 
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
@@ -342,6 +361,7 @@ DEFAULT_TXT_MAZE_LAYOUT = """
 """
 
 DEFAULT_TXT_MAZE_PATH = Path("maze/maze.yaml")
+DEFAULT_BRICK_USD_PATH = Path("maze/brick/wall_1.usd")
 
 
 def _extract_first_token(items: Any) -> str | None:
@@ -404,6 +424,30 @@ def txt2maze(grid_text: str, wall_token: str = "#", open_token: str = ".") -> np
     return maze
 
 
+def _meters_to_pixels(value_m: float, horizontal_scale: float, *, mode: str = "round") -> int:
+    """Convert meters to height-field pixels without fragile float truncation."""
+    ratio = float(value_m) / float(horizontal_scale)
+    if mode == "round":
+        pixels = int(round(ratio))
+    elif mode == "ceil":
+        pixels = int(math.ceil(ratio - 1.0e-9))
+    else:
+        raise ValueError(f"Unsupported mode={mode!r}. Expected 'round' or 'ceil'.")
+    return max(1, pixels)
+
+
+def _minimum_generator_tile_size(
+    maze_extent_m: float,
+    horizontal_scale: float,
+    border_width_m: float = 0.0,
+) -> float:
+    """Return the minimum outer tile size needed after the height-field wrapper shrinks the interior."""
+    maze_pixels = _meters_to_pixels(maze_extent_m, horizontal_scale, mode="round")
+    border_pixels = int(float(border_width_m) / float(horizontal_scale)) + 1
+    min_size_pixels = maze_pixels + 2 * border_pixels - 1
+    return float(min_size_pixels) * float(horizontal_scale)
+
+
 def _resolve_txt_maze_spec() -> tuple[tuple[str, ...], str, str, str]:
     wall_token = args_cli.maze_wall_token
     open_token = args_cli.maze_open_token
@@ -460,10 +504,10 @@ def _resolve_txt_maze_spec() -> tuple[tuple[str, ...], str, str, str]:
 @height_field_to_mesh
 def txt_maze_terrain(_difficulty: float, cfg: "TxtMazeTerrainCfg") -> np.ndarray:
     """Generate a height-field terrain directly from a txt occupancy layout."""
-    cell_pixels = int(cfg.cell_size / cfg.horizontal_scale)
-    wall_height = int(cfg.wall_height / cfg.vertical_scale)
-    terrain_w = int(cfg.size[0] / cfg.horizontal_scale)
-    terrain_h = int(cfg.size[1] / cfg.horizontal_scale)
+    cell_pixels = _meters_to_pixels(cfg.cell_size, cfg.horizontal_scale, mode="round")
+    wall_height = max(1, int(round(cfg.wall_height / cfg.vertical_scale)))
+    terrain_w = _meters_to_pixels(cfg.size[0], cfg.horizontal_scale, mode="ceil")
+    terrain_h = _meters_to_pixels(cfg.size[1], cfg.horizontal_scale, mode="ceil")
 
     maze = txt2maze("\n".join(cfg.maze_rows), wall_token=cfg.wall_token, open_token=cfg.open_token)
     grid_rows, grid_cols = maze.shape
@@ -557,6 +601,129 @@ def _build_txt_maze_subterrain() -> tuple[str, TxtMazeTerrainCfg, int, int]:
     return source_label, cfg, grid_rows, grid_cols
 
 
+def _resolve_brick_mdl_path(brick_source: Path) -> Path:
+    """Resolve the usable MDL file from a packaged brick USD or a direct MDL input."""
+    if brick_source.suffix.lower() == ".mdl":
+        return brick_source
+    if brick_source.suffix.lower() != ".usd":
+        raise ValueError(f"Unsupported brick material source: {brick_source}. Expected .usd or .mdl.")
+
+    stage = Usd.Stage.Open(str(brick_source))
+    if stage is None:
+        raise ValueError(f"Failed to open brick USD: {brick_source}")
+
+    shader_prim = next((prim for prim in stage.Traverse() if prim.GetTypeName() == "Shader"), None)
+    if shader_prim is None:
+        raise ValueError(f"Brick USD did not contain a shader prim: {brick_source}")
+
+    asset_attr = shader_prim.GetAttribute("info:mdl:sourceAsset")
+    asset_path = asset_attr.Get() if asset_attr is not None else None
+    if asset_path is None:
+        raise ValueError(f"Brick USD did not contain info:mdl:sourceAsset: {brick_source}")
+
+    mdl_path = Path(asset_path.resolvedPath if isinstance(asset_path, Sdf.AssetPath) else str(asset_path))
+    if not mdl_path.is_absolute():
+        mdl_path = (brick_source.parent / mdl_path).resolve()
+    return mdl_path
+
+
+def _get_mesh_face_indices(points: np.ndarray, face_counts: np.ndarray, face_vertex_indices: np.ndarray) -> list[int]:
+    """Return face indices that belong to raised walls rather than flat floor."""
+    wall_face_indices: list[int] = []
+    cursor = 0
+    height_threshold = 1.0e-4
+    for face_idx, face_count in enumerate(face_counts.tolist()):
+        face_indices = face_vertex_indices[cursor : cursor + face_count]
+        cursor += face_count
+        if np.any(points[face_indices, 2] > height_threshold):
+            wall_face_indices.append(face_idx)
+    return wall_face_indices
+
+
+def apply_brick_wall_material(env) -> int:
+    """Bind the brick material to raised wall faces on the terrain mesh."""
+    if not args_cli.brick_walls:
+        debug_log("Brick wall material disabled")
+        return 0
+
+    brick_source_path = Path(args_cli.brick_usd).expanduser()
+    if not brick_source_path.is_absolute():
+        brick_source_path = Path.cwd() / brick_source_path
+    if not brick_source_path.exists():
+        print(f"[WARN] Brick material source not found at {brick_source_path}; skipping brick wall material.")
+        return 0
+
+    mdl_path = _resolve_brick_mdl_path(brick_source_path)
+    if not mdl_path.exists():
+        print(f"[WARN] Brick MDL not found at {mdl_path}; skipping brick wall material.")
+        return 0
+
+    terrain = env.unwrapped.scene.terrain
+    if not terrain.terrain_prim_paths:
+        print("[WARN] Terrain importer did not expose any terrain prim paths; skipping brick wall material.")
+        return 0
+
+    stage = sim_utils.get_current_stage()
+    terrain_root_path = terrain.terrain_prim_paths[0]
+    mesh_prim_path = f"{terrain_root_path}/mesh"
+    mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
+    if not mesh_prim.IsValid():
+        print(f"[WARN] Terrain mesh prim not found at {mesh_prim_path}; skipping brick wall material.")
+        return 0
+
+    material_path = "/World/TxtMazeBrickMaterial"
+    if not stage.GetPrimAtPath(material_path).IsValid():
+        brick_cfg = sim_utils.MdlFileCfg(
+            mdl_path=str(mdl_path),
+            project_uvw=True,
+            texture_scale=(args_cli.brick_texture_scale, args_cli.brick_texture_scale),
+        )
+        brick_cfg.func(material_path, brick_cfg)
+
+    mesh = UsdGeom.Mesh(mesh_prim)
+    points = np.asarray(mesh.GetPointsAttr().Get())
+    face_counts = np.asarray(mesh.GetFaceVertexCountsAttr().Get())
+    face_vertex_indices = np.asarray(mesh.GetFaceVertexIndicesAttr().Get())
+    wall_face_indices = _get_mesh_face_indices(points, face_counts, face_vertex_indices)
+    if not wall_face_indices:
+        print("[INFO] Terrain mesh did not contain any raised wall faces; skipping brick wall material.")
+        return 0
+
+    base_material_path = UsdShade.MaterialBindingAPI(mesh_prim).GetDirectBinding().GetMaterialPath()
+    if base_material_path:
+        sim_utils.bind_visual_material(
+            mesh_prim_path,
+            str(base_material_path),
+            stage=stage,
+            stronger_than_descendants=False,
+        )
+
+    material_api = UsdShade.MaterialBindingAPI.Apply(mesh_prim)
+    subset_name = "brickWalls"
+    subset = next(
+        (candidate for candidate in material_api.GetMaterialBindSubsets() if candidate.GetPrim().GetName() == subset_name),
+        None,
+    )
+    if subset is None:
+        subset = material_api.CreateMaterialBindSubset(subset_name, wall_face_indices)
+    else:
+        subset.GetIndicesAttr().Set(wall_face_indices)
+    material_api.SetMaterialBindSubsetsFamilyType(UsdGeom.Tokens.nonOverlapping)
+
+    brick_material = UsdShade.Material(stage.GetPrimAtPath(material_path))
+    if not brick_material:
+        print(f"[WARN] Brick material prim not found at {material_path}; skipping brick wall material.")
+        return 0
+
+    UsdShade.MaterialBindingAPI.Apply(subset.GetPrim()).Bind(brick_material)
+    sim_utils.update_stage()
+    print(
+        f"[INFO] Applied brick material to {len(wall_face_indices)} wall faces on {mesh_prim_path} "
+        f"using {mdl_path}"
+    )
+    return len(wall_face_indices)
+
+
 def build_standalone_terrain_cfg(env_cfg: ManagerBasedRLEnvCfg) -> TerrainImporterCfg:
     """Build the terrain locally in this script while keeping the rest of the task env unchanged."""
     base_terrain_cfg = env_cfg.scene.terrain
@@ -568,13 +735,20 @@ def build_standalone_terrain_cfg(env_cfg: ManagerBasedRLEnvCfg) -> TerrainImport
     cell_size = subterrain_cfg.cell_size
     maze_extent = max(grid_rows, grid_cols) * cell_size
     base_tile_size = float(base_tg.size[0])
+    horizontal_scale = 0.5
+    min_effective_tile_size = _minimum_generator_tile_size(
+        maze_extent_m=maze_extent,
+        horizontal_scale=horizontal_scale,
+        border_width_m=float(subterrain_cfg.border_width),
+    )
     if args_cli.terrain_size is not None:
         terrain_size = float(args_cli.terrain_size)
     else:
-        terrain_size = max(maze_extent, base_tile_size)
-    if terrain_size < maze_extent:
+        terrain_size = max(base_tile_size, min_effective_tile_size)
+    if terrain_size < min_effective_tile_size:
         raise ValueError(
-            f"terrain_size={terrain_size:.2f}m is smaller than the txt maze footprint {maze_extent:.2f}m. "
+            f"terrain_size={terrain_size:.2f}m is smaller than the minimum tile size {min_effective_tile_size:.2f}m "
+            f"needed for the txt maze footprint {maze_extent:.2f}m at horizontal_scale={horizontal_scale:.2f}m. "
             "Increase --terrain_size or reduce the maze dimensions."
         )
     if terrain_size < base_tile_size:
@@ -605,7 +779,8 @@ def build_standalone_terrain_cfg(env_cfg: ManagerBasedRLEnvCfg) -> TerrainImport
     print(
         f"[INFO] Local txt2maze terrain: layout={grid_rows}x{grid_cols} cells from {source_label}; "
         f"cell_size={cell_size:.2f}m; maze_extent={maze_extent:.1f}m; "
-        f"tile_grid={num_rows}x{num_cols}; tile_size={terrain_size_xy[0]:.1f}m"
+        f"tile_grid={num_rows}x{num_cols}; tile_size={terrain_size_xy[0]:.1f}m; "
+        f"min_tile_size={min_effective_tile_size:.1f}m"
     )
 
     return TerrainImporterCfg(
@@ -616,7 +791,7 @@ def build_standalone_terrain_cfg(env_cfg: ManagerBasedRLEnvCfg) -> TerrainImport
             border_width=args_cli.terrain_border_width,
             num_rows=num_rows,
             num_cols=num_cols,
-            horizontal_scale=0.5,
+            horizontal_scale=horizontal_scale,
             vertical_scale=0.005,
             slope_threshold=0.75,
             use_cache=False,
@@ -1057,6 +1232,8 @@ def main():
         f"Wrapped env | num_envs={env.num_envs} num_actions={env.num_actions} "
         f"max_episode_length={env.max_episode_length}"
     )
+    debug_log("Applying brick wall material")
+    apply_brick_wall_material(env)
 
     if args_cli.checkpoint:
         resume_path = args_cli.checkpoint
