@@ -44,6 +44,12 @@ parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--spawn_height", type=float, default=0.02)
 parser.add_argument("--wheel_radius", type=float, default=0.08)
 parser.add_argument("--wheel_track", type=float, default=0.56)
+parser.add_argument(
+    "--wheel_effort_limit",
+    type=float,
+    default=5000.0,
+    help="Wheel actuator effort limit in simulation. Lower values soften acceleration response.",
+)
 
 # Drive arguments
 parser.add_argument("--linear_speed", type=float, default=2.5)
@@ -66,7 +72,7 @@ parser.add_argument("--cam_x", type=float, default=0.22, help="Camera X offset f
 parser.add_argument("--cam_z", type=float, default=0.50, help="Camera Z offset from base_link (m).")
 parser.add_argument("--cam_pitch", type=float, default=15.0, help="Camera downward pitch (degrees).")
 parser.add_argument("--cam_max_dist", type=float, default=11.0, help="Max depth range (m).")
-parser.add_argument("--cam_debug_vis", action="store_true", help="Show raycaster debug rays in viewport.")
+parser.add_argument("--cam_debug_vis", action="store_true", default=True, help="Show raycaster debug rays in viewport.")
 
 # Debug / Friction
 parser.add_argument("--debug_drive", action="store_true")
@@ -155,7 +161,7 @@ def build_terrain_cfg(args) -> TerrainImporterCfg:
         ),
         max_init_terrain_level=0, collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="multiply", restitution_combine_mode="multiply",
+            friction_combine_mode="average", restitution_combine_mode="multiply",
             restitution=args.ground_restitution,
             static_friction=args.ground_static_friction,
             dynamic_friction=args.ground_dynamic_friction,
@@ -199,7 +205,8 @@ ROBOT_CFG = ArticulationCfg(
         "wheel_drive": ImplicitActuatorCfg(
             joint_names_expr=["wheel_.*_joint"],
             stiffness=0.0, damping=50.0,
-            effort_limit_sim=5000.0, velocity_limit_sim=200.0,
+            effort_limit_sim=args_cli.wheel_effort_limit,
+            velocity_limit_sim=200.0,
         )
     },
 )

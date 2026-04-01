@@ -88,7 +88,7 @@ parser.add_argument(
 parser.add_argument(
     "--disable_early_goal_termination",
     action="store_true",
-    help="Disable success-based early termination so episodes run to timeout unless another failure occurs.",
+    help="Disable in_goal and near_goal terminations so episodes run to timeout unless another failure occurs.",
 )
 parser.add_argument(
     "--enable_pose_goal_reward",
@@ -403,7 +403,12 @@ def main():
     if args_cli.disable_friction_randomization:
         env_cfg.events.physics_material = None
     if args_cli.disable_early_goal_termination:
-        env_cfg.terminations.early_termination = None
+        if hasattr(env_cfg.terminations, "in_goal"):
+            env_cfg.terminations.in_goal = None
+        if hasattr(env_cfg.terminations, "near_goal"):
+            env_cfg.terminations.near_goal = None
+        if hasattr(env_cfg.terminations, "early_termination"):
+            env_cfg.terminations.early_termination = None
     if args_cli.disable_action_scale_randomization:
         env_cfg.events.randomize_action_scale = None
     if args_cli.disable_low_pass_randomization:
