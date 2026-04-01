@@ -79,6 +79,26 @@ parser.add_argument("--maze_wall_token", type=str, default="#", help="Single-cha
 parser.add_argument("--maze_open_token", type=str, default=".", help="Single-character floor token in the txt maze.")
 parser.add_argument("--cell_size", type=float, default=None, help="Maze cell size in meters. Defaults to 2.0.")
 parser.add_argument(
+    "--inner_obstacles",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Add random non-maze obstacles inside open txt-maze cells.",
+)
+parser.add_argument(
+    "--difficulty",
+    type=float,
+    nargs=2,
+    default=None,
+    metavar=("MIN", "MAX"),
+    help="Inner-obstacle difficulty range, e.g. --difficulty 0.3 0.8",
+)
+parser.add_argument(
+    "--wall_ratio",
+    type=float,
+    default=None,
+    help="Random obstacle ratio for inner obstacles (0=full blocks, 1=all randomized obstacles).",
+)
+parser.add_argument(
     "--terrain_size",
     type=float,
     default=None,
@@ -209,8 +229,8 @@ import isaaclab_nav_task.navigation.mdp as nav_mdp
 
 from isaaclab_nav_task.navigation.mdp.navigation.goal_commands import PositionSampler, RobotNavigationGoalCommand
 from isaaclab_nav_task.navigation.mdp.navigation.goal_commands_cfg import RobotNavigationGoalCommandCfg
-from isaaclab_nav_task.terrains.hf_terrains_maze import TerrainData
-from isaaclab_nav_task.terrains.terrain_constants import PADDING
+from isaaclab_nav_task.terrains.hf_terrains_maze import TerrainData, make_random_obstacle
+from isaaclab_nav_task.terrains.terrain_constants import HORIZONTAL_SCALE, OBSTACLES, PADDING
 from isaaclab_nav_task.vecenv_wrapper import SruRslRlVecEnvWrapper
 
 
@@ -424,6 +444,10 @@ def txt2maze(grid_text: str, wall_token: str = "#", open_token: str = ".") -> np
     return maze
 
 
+def _default_inner_wall_ratio() -> float:
+    return float(args_cli.wall_ratio) if args_cli.wall_ratio is not None else 1.0
+
+
 def _meters_to_pixels(value_m: float, horizontal_scale: float, *, mode: str = "round") -> int:
     """Convert meters to height-field pixels without fragile float truncation."""
     ratio = float(value_m) / float(horizontal_scale)
@@ -501,13 +525,65 @@ def _resolve_txt_maze_spec() -> tuple[tuple[str, ...], str, str, str]:
     return rows, wall_token, open_token, source_label
 
 
+def _make_txt_cell_obstacle(rng: np.random.Generator, size: int, wall_height: int) -> np.ndarray:
+    """Generate the same positive-height obstacle family used by the procedural task terrain."""
+    return make_random_obstacle(
+        rng,
+        size,
+        wall_height,
+        is_pit=False,
+        pillar_weight=OBSTACLES.NON_MAZE_PILLAR_WEIGHT,
+    )
+
+
+def _add_inner_non_maze_obstacles(
+    rng: np.random.Generator,
+    maze: np.ndarray,
+    terrain: TerrainData,
+    cfg: "TxtMazeTerrainCfg",
+    difficulty: float,
+    wall_height: int,
+    cell_pixels: int,
+    x_offset: int,
+    y_offset: int,
+):
+    """Add random non-maze obstacles inside open txt-maze cells."""
+    if not cfg.inner_obstacles:
+        return
+
+    obstacle_prob = float(np.clip(difficulty, 0.0, 1.0)) * OBSTACLES.NON_MAZE_DENSITY
+    if obstacle_prob <= 0.0:
+        return
+
+    for row_idx in range(maze.shape[0]):
+        for col_idx in range(maze.shape[1]):
+            if maze[row_idx, col_idx] != 0:
+                continue
+            if rng.random() >= obstacle_prob:
+                continue
+
+            xs = x_offset + row_idx * cell_pixels
+            xe = xs + cell_pixels
+            ys = y_offset + col_idx * cell_pixels
+            ye = ys + cell_pixels
+            if cfg.randomize_inner_obstacles and rng.random() < cfg.inner_obstacle_wall_ratio:
+                obs = _make_txt_cell_obstacle(rng, cell_pixels, wall_height)
+                terrain.heights[xs:xe, ys:ye] = obs[: xe - xs, : ye - ys]
+                terrain.valid_mask[xs:xe, ys:ye] = False
+                terrain.platform_mask[xs:xe, ys:ye] = False
+            else:
+                height_scale = rng.uniform(OBSTACLES.SCALE_MIN, OBSTACLES.SCALE_MAX)
+                terrain.set_obstacle(xs, xe, ys, ye, int(wall_height * height_scale))
+
+
 @height_field_to_mesh
-def txt_maze_terrain(_difficulty: float, cfg: "TxtMazeTerrainCfg") -> np.ndarray:
+def txt_maze_terrain(difficulty: float, cfg: "TxtMazeTerrainCfg") -> np.ndarray:
     """Generate a height-field terrain directly from a txt occupancy layout."""
     cell_pixels = _meters_to_pixels(cfg.cell_size, cfg.horizontal_scale, mode="round")
     wall_height = max(1, int(round(cfg.wall_height / cfg.vertical_scale)))
     terrain_w = _meters_to_pixels(cfg.size[0], cfg.horizontal_scale, mode="ceil")
     terrain_h = _meters_to_pixels(cfg.size[1], cfg.horizontal_scale, mode="ceil")
+    rng = cfg.rng if cfg.rng is not None else np.random.default_rng()
 
     maze = txt2maze("\n".join(cfg.maze_rows), wall_token=cfg.wall_token, open_token=cfg.open_token)
     grid_rows, grid_cols = maze.shape
@@ -537,6 +613,8 @@ def txt_maze_terrain(_difficulty: float, cfg: "TxtMazeTerrainCfg") -> np.ndarray
                 terrain.set_ground(xs, xe, ys, ye)
             else:
                 terrain.set_obstacle(xs, xe, ys, ye, wall_height)
+
+    _add_inner_non_maze_obstacles(rng, maze, terrain, cfg, difficulty, wall_height, cell_pixels, x_offset, y_offset)
 
     goal_padding_cells = int(cfg.goal_padding_cells) if cfg.goal_padding_cells is not None else PADDING.GOAL_PADDING
     spawn_padding_cells = (
@@ -579,7 +657,11 @@ class TxtMazeTerrainCfg(HfTerrainBaseCfg):
     wall_height: float = 1.5
     goal_padding_cells: int | None = None
     spawn_padding_cells: int | None = None
+    inner_obstacles: bool = False
+    randomize_inner_obstacles: bool = True
+    inner_obstacle_wall_ratio: float = 1.0
     add_goal: Any = True
+    rng: np.random.Generator | None = None
 
 
 def _build_txt_maze_subterrain() -> tuple[str, TxtMazeTerrainCfg, int, int]:
@@ -596,6 +678,9 @@ def _build_txt_maze_subterrain() -> tuple[str, TxtMazeTerrainCfg, int, int]:
         wall_height=args_cli.wall_height,
         goal_padding_cells=args_cli.goal_padding_cells,
         spawn_padding_cells=args_cli.spawn_padding_cells,
+        inner_obstacles=bool(args_cli.inner_obstacles),
+        randomize_inner_obstacles=True,
+        inner_obstacle_wall_ratio=_default_inner_wall_ratio(),
         add_goal=True,
     )
     return source_label, cfg, grid_rows, grid_cols
@@ -735,7 +820,12 @@ def build_standalone_terrain_cfg(env_cfg: ManagerBasedRLEnvCfg) -> TerrainImport
     cell_size = subterrain_cfg.cell_size
     maze_extent = max(grid_rows, grid_cols) * cell_size
     base_tile_size = float(base_tg.size[0])
-    horizontal_scale = 0.5
+    horizontal_scale = HORIZONTAL_SCALE
+    difficulty_range = (
+        tuple(args_cli.difficulty)
+        if args_cli.difficulty is not None
+        else ((0.5, 1.0) if args_cli.inner_obstacles else (1.0, 1.0))
+    )
     min_effective_tile_size = _minimum_generator_tile_size(
         maze_extent_m=maze_extent,
         horizontal_scale=horizontal_scale,
@@ -779,8 +869,11 @@ def build_standalone_terrain_cfg(env_cfg: ManagerBasedRLEnvCfg) -> TerrainImport
     print(
         f"[INFO] Local txt2maze terrain: layout={grid_rows}x{grid_cols} cells from {source_label}; "
         f"cell_size={cell_size:.2f}m; maze_extent={maze_extent:.1f}m; "
+        f"height_field_scale={horizontal_scale:.2f}m; "
         f"tile_grid={num_rows}x{num_cols}; tile_size={terrain_size_xy[0]:.1f}m; "
-        f"min_tile_size={min_effective_tile_size:.1f}m"
+        f"min_tile_size={min_effective_tile_size:.1f}m; "
+        f"inner_obstacles={bool(args_cli.inner_obstacles)}; difficulty={difficulty_range}; "
+        f"wall_ratio={_default_inner_wall_ratio():.2f}"
     )
 
     return TerrainImporterCfg(
@@ -796,7 +889,7 @@ def build_standalone_terrain_cfg(env_cfg: ManagerBasedRLEnvCfg) -> TerrainImport
             slope_threshold=0.75,
             use_cache=False,
             curriculum=False,
-            difficulty_range=(1.0, 1.0),
+            difficulty_range=difficulty_range,
             sub_terrains=sub_terrains,
         ),
         max_init_terrain_level=max_init_terrain_level,
