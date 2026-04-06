@@ -70,6 +70,10 @@ class DiffDriveNavigationEnvCfg(NavigationEnvCfg):
         # Enable contact processing for diff-drive (base class disables it for
         # legged robots as an optimization, but wheels need proper friction solving)
         self.sim.disable_contact_processing = False
+        # Navigation runs many aggregate contact pair updates across thousands of
+        # terrains/envs. The Isaac Lab default (2**25) can overflow here and make
+        # PhysX drop interactions, so leave explicit headroom for diff-drive tasks.
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2**27
 
         # Use average friction combine so robot-side friction randomization does
         # not get multiplied down into overly slippery wheel-ground contact.

@@ -18,7 +18,7 @@ from isaaclab_nav_task.navigation.config.rl_cfg import (
 class DiffDriveNavMDPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """MDPO runner configuration for diff-drive navigation."""
 
-    num_steps_per_env = 24
+    num_steps_per_env = 32
     max_iterations = 15000
     save_interval = 50
     logger = "wandb"
@@ -30,13 +30,13 @@ class DiffDriveNavMDPORunnerCfg(RslRlOnPolicyRunnerCfg):
     policy = RslRlPpoActorCriticCfg(
         class_name="ActorCriticSRU",
         init_noise_std=[1.0, 1.0],  # [vx, yaw_target_rate]
-        actor_hidden_dims=[256, 256],
-        critic_hidden_dims=[256, 256],
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
         activation="lrelu",
         rnn_hidden_size=512,
         rnn_type="lstm_sru",
         rnn_num_layers=1,
-        dropout=0.2,
+        dropout=0.1,
         num_cameras=1,
         image_input_dims=(64, 5, 8),
         height_input_dims=(64, 7, 7),
@@ -49,10 +49,10 @@ class DiffDriveNavMDPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_clip_param=0.2,
         entropy_coef=1.0e-3,
         num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=3.0e-4,
-        min_learning_rate=3.0e-4,
-        schedule="fixed",
+        num_mini_batches=8,
+        learning_rate=1.0e-3,
+        min_learning_rate=3.0e-5,
+        schedule="exponential",
         gamma=0.999,
         lam=0.95,
         desired_kl=0.01,

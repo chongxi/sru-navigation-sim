@@ -125,6 +125,12 @@ parser.add_argument(
     help="Override the trapped termination penalty weight.",
 )
 parser.add_argument(
+    "--disable_trapped_termination",
+    action="store_true",
+    default=False,
+    help="Disable the trapped termination condition.",
+)
+parser.add_argument(
     "--large_pitch_angle_penalty_weight",
     type=float,
     default=None,
@@ -324,6 +330,11 @@ def main():
         agent_cfg.torch_compile_mode = args_cli.torch_compile_mode
     if args_cli.run_name is not None:
         agent_cfg.run_name = args_cli.run_name
+    if args_cli.disable_trapped_termination:
+        if getattr(env_cfg.terminations, "trapped", None) is not None:
+            env_cfg.terminations.trapped = None
+        if getattr(env_cfg.rewards, "trapped_penalty", None) is not None:
+            env_cfg.rewards.trapped_penalty = None
 
     # Override reward config from command line
     if args_cli.terrain_fall_penalty_weight is not None and hasattr(env_cfg.rewards, "terrain_fall_penalty"):
@@ -430,7 +441,7 @@ def main():
             start_step=schedule_start_step,
             end_step=schedule_end_step,
         )
-    if args_cli.trapped_penalty_weight_end is not None and hasattr(env_cfg.rewards, "trapped_penalty"):
+    if args_cli.trapped_penalty_weight_end is not None and getattr(env_cfg.rewards, "trapped_penalty", None) is not None:
         _attach_linear_reward_schedule(
             env_cfg,
             attr_name="trapped_penalty_weight_schedule",
